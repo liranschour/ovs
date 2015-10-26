@@ -116,6 +116,11 @@ struct ovsdb_monitor_table {
     struct ovsdb_monitor_column *columns;
     size_t n_columns;
 
+    /* Columns in ovsdb_monitor_row have different indexes then in
+     * ovsdb_row. This field maps between column->index to the index in the
+     * ovsdb_monitor_row. It is used for condition evaluation */
+    unsigned int *columns_index_map;
+
     /* Contains 'ovsdb_monitor_changes' indexed by 'transaction'. */
     struct hmap changes;
 };
@@ -305,6 +310,19 @@ ovsdb_monitor_row_destroy(const struct ovsdb_monitor_table *mt,
     }
 }
 
+static void
+ovsdb_monitor_table_columns_sort(const struct ovsdb_monitor_table *mt)
+{
+    int i;
+
+    qsort(mt->columns, mt->n_columns, sizeof *mt->columns,
+          compare_ovsdb_monitor_column);
+    for (i = 1; i < mt->n_columns; i++) {
+        /* re-set index map due to sort */
+        mt->columns_index_map[mt->columns[i].column->index] = i;
+    }
+}
+
 void
 ovsdb_monitor_add_jsonrpc_monitor(struct ovsdb_monitor *dbmon,
                                   struct ovsdb_jsonrpc_monitor *jsonrpc_monitor)
@@ -342,11 +360,17 @@ ovsdb_monitor_add_table(struct ovsdb_monitor *m,
                         const struct ovsdb_table *table)
 {
     struct ovsdb_monitor_table *mt;
+    int i;
 
     mt = xzalloc(sizeof *mt);
     mt->table = table;
     shash_add(&m->tables, table->schema->name, mt);
     hmap_init(&mt->changes);
+    mt->columns_index_map =
+        xmalloc(sizeof(unsigned int) * shash_count(&table->schema->columns));
+    for (i = 0; i < shash_count(&table->schema->columns); i++) {
+        mt->columns_index_map[i] = -1;
+    }
 }
 
 void
@@ -367,6 +391,7 @@ ovsdb_monitor_add_column(struct ovsdb_monitor *dbmon,
     }
 
     mt->select |= select;
+    mt->columns_index_map[column->index] = mt->n_columns;
     c = &mt->columns[mt->n_columns++];
     c->column = column;
     c->select = select;
@@ -386,8 +411,7 @@ ovsdb_monitor_table_check_duplicates(struct ovsdb_monitor *m,
 
     if (mt) {
         /* Check for duplicate columns. */
-        qsort(mt->columns, mt->n_columns, sizeof *mt->columns,
-              compare_ovsdb_monitor_column);
+        ovsdb_monitor_table_columns_sort(mt);
         for (i = 1; i < mt->n_columns; i++) {
             if (mt->columns[i].column == mt->columns[i - 1].column) {
                 return mt->columns[i].column->name;
@@ -1113,6 +1137,7 @@ ovsdb_monitor_destroy(struct ovsdb_monitor *dbmon)
         }
         hmap_destroy(&mt->changes);
         free(mt->columns);
+        free(mt->columns_index_map);
         free(mt);
     }
     shash_destroy(&dbmon->tables);

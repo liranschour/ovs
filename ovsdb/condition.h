@@ -91,6 +91,9 @@ void ovsdb_condition_diff(const struct ovsdb_condition *a,
                           const struct ovsdb_condition *b,
                           struct ovsdb_condition *added,
                           struct ovsdb_condition *removed);
+const struct ovsdb_column **
+ovsdb_condition_get_columns(const struct ovsdb_condition *cond,
+                            size_t *n_columns);
 
 static inline bool
 ovsdb_condition_empty_or_match_any(const struct ovsdb_datum *row_datum,

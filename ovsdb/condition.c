@@ -499,3 +499,24 @@ ovsdb_condition_diff(const struct ovsdb_condition *a,
         ovsdb_clause_add(b_only, &b->clauses[j], &added_allocated);
     }
 }
+
+const struct ovsdb_column **
+ovsdb_condition_get_columns(const struct ovsdb_condition *cond,
+                            size_t *n_columns)
+{
+    const struct ovsdb_column **columns;
+    size_t i;
+
+    if (!cond->n_clauses) {
+        *n_columns = 0;
+        return NULL;
+    }
+
+    columns = xmalloc(cond->n_clauses * sizeof *columns);
+    for (i = 0; i < cond->n_clauses; i++) {
+        columns[i] = cond->clauses[i].column;
+    }
+    *n_columns = i;
+
+    return columns;
+}

@@ -90,4 +90,8 @@ void ovsdb_condition_diff(const struct ovsdb_condition *a,
                           struct ovsdb_condition *added,
                           struct ovsdb_condition *removed);
 
+const struct ovsdb_column **
+ovsdb_condition_get_columns(const struct ovsdb_condition *cond,
+                            size_t *n_columns);
+
 #endif /* ovsdb/condition.h */

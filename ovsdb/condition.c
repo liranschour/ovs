@@ -64,6 +64,18 @@ ovsdb_clause_from_json(const struct ovsdb_table_schema *ts,
     const char *column_name;
     struct ovsdb_type type;
 
+    if (json->type == JSON_TRUE || json->type == JSON_FALSE) {
+        function_name = (json->type == JSON_TRUE) ? "true" : "false";
+        error = ovsdb_function_from_string(function_name, &clause->function);
+
+        /* column and arg fields are not being used with boolean function
+         * use dummy values */
+        clause->column = ovsdb_table_schema_get_column(ts, "_uuid");
+        clause->index = clause->column->index;
+        ovsdb_datum_init_default(&clause->arg, &clause->column->type);
+        return error;
+    }
+
     if (json->type != JSON_ARRAY
         || json->u.array.n != 3
         || json->u.array.elems[0]->type != JSON_STRING
@@ -79,6 +91,7 @@ ovsdb_clause_from_json(const struct ovsdb_table_schema *ts,
                                   "No column %s in table %s.",
                                   column_name, ts->name);
     }
+    clause->index = clause->column->index;
     type = clause->column->type;
 
     function_name = json_string(array->elems[1]);
@@ -109,7 +122,8 @@ ovsdb_clause_from_json(const struct ovsdb_table_schema *ts,
             return error;
         }
         break;
-
+    case OVSDB_F_TRUE:
+    case OVSDB_F_FALSE:
     case OVSDB_F_EQ:
     case OVSDB_F_NE:
         break;
@@ -164,6 +178,19 @@ compare_clauses_3way(const void *a_, const void *b_)
     }
 }
 
+static int
+compare_clauses_3way_with_data(const void *a_, const void *b_)
+{
+    const struct ovsdb_clause *a = a_;
+    const struct ovsdb_clause *b = b_;
+    int res;
+
+    res = compare_clauses_3way(a, b);
+    return res ? res : ovsdb_datum_compare_3way(&a->arg,
+                                                &b->arg,
+                                                &a->column->type);
+ }
+
 struct ovsdb_error *
 ovsdb_condition_from_json(const struct ovsdb_table_schema *ts,
                           const struct json *json,
@@ -185,12 +212,13 @@ ovsdb_condition_from_json(const struct ovsdb_table_schema *ts,
             cnd->n_clauses = 0;
             return error;
         }
+        bitmap_set1(cnd->functions, cnd->clauses[i].function);
         cnd->n_clauses++;
     }
 
     /* A real database would have a query optimizer here. */
     qsort(cnd->clauses, cnd->n_clauses, sizeof *cnd->clauses,
-          compare_clauses_3way);
+          compare_clauses_3way_with_data);
 
     return NULL;
 }
@@ -198,10 +226,16 @@ ovsdb_condition_from_json(const struct ovsdb_table_schema *ts,
 static struct json *
 ovsdb_clause_to_json(const struct ovsdb_clause *clause)
 {
-    return json_array_create_3(
-        json_string_create(clause->column->name),
-        json_string_create(ovsdb_function_to_string(clause->function)),
-        ovsdb_datum_to_json(&clause->arg, &clause->column->type));
+    if (clause->function != OVSDB_F_TRUE &&
+        clause->function != OVSDB_F_FALSE) {
+        return json_array_create_3(
+                json_string_create(clause->column->name),
+                json_string_create(ovsdb_function_to_string(clause->function)),
+                ovsdb_datum_to_json(&clause->arg, &clause->column->type));
+    }
+
+    return json_boolean_create(clause->function == OVSDB_F_TRUE ?
+                               true : false);
 }
 
 struct json *
@@ -218,13 +252,20 @@ ovsdb_condition_to_json(const struct ovsdb_condition *cnd)
 }
 
 static bool
-ovsdb_clause_evaluate(const struct ovsdb_row *row,
-                      const struct ovsdb_clause *c)
+ovsdb_clause_evaluate(const struct ovsdb_datum *fields,
+                      const struct ovsdb_clause *c,
+                      unsigned int index_map[])
 {
-    const struct ovsdb_datum *field = &row->fields[c->column->index];
+    const struct ovsdb_datum *field = &fields[index_map ?
+                                              index_map[c->column->index] :
+                                              c->column->index];
     const struct ovsdb_datum *arg = &c->arg;
     const struct ovsdb_type *type = &c->column->type;
 
+    if (c->function == OVSDB_F_TRUE ||
+        c->function == OVSDB_F_FALSE) {
+        return c->function == OVSDB_F_TRUE ? true : false;
+    }
     if (ovsdb_type_is_optional_scalar(type) && field->n == 0) {
         switch (c->function) {
             case OVSDB_F_LT:
@@ -237,6 +278,9 @@ ovsdb_clause_evaluate(const struct ovsdb_row *row,
             case OVSDB_F_NE:
             case OVSDB_F_EXCLUDES:
                 return true;
+            case OVSDB_F_TRUE:
+            case OVSDB_F_FALSE:
+                OVS_NOT_REACHED();
         }
     } else if (ovsdb_type_is_scalar(type)
                || ovsdb_type_is_optional_scalar(type)) {
@@ -257,6 +301,9 @@ ovsdb_clause_evaluate(const struct ovsdb_row *row,
             return cmp >= 0;
         case OVSDB_F_GT:
             return cmp > 0;
+        case OVSDB_F_TRUE:
+        case OVSDB_F_FALSE:
+            OVS_NOT_REACHED();
         }
     } else {
         switch (c->function) {
@@ -272,6 +319,8 @@ ovsdb_clause_evaluate(const struct ovsdb_row *row,
         case OVSDB_F_LE:
         case OVSDB_F_GE:
         case OVSDB_F_GT:
+        case OVSDB_F_TRUE:
+        case OVSDB_F_FALSE:
             OVS_NOT_REACHED();
         }
     }
@@ -279,19 +328,61 @@ ovsdb_clause_evaluate(const struct ovsdb_row *row,
     OVS_NOT_REACHED();
 }
 
+static void
+ovsdb_clause_clone(struct ovsdb_clause *new, struct ovsdb_clause *old)
+{
+    new->function = old->function;
+    new->column = old->column;
+    ovsdb_datum_clone(&new->arg,
+                      &old->arg,
+                      &old->column->type);
+}
+
+static void
+ovsdb_clause_add(struct ovsdb_condition *cond, struct ovsdb_clause *c,
+                 size_t *allocated_clauses)
+{
+    if (cond->n_clauses >= *allocated_clauses) {
+        cond->clauses = x2nrealloc(cond->clauses, allocated_clauses,
+                                   sizeof *cond->clauses);
+    }
+    ovsdb_clause_clone(&cond->clauses[cond->n_clauses], c);
+    bitmap_set1(cond->functions, c->function);
+    cond->n_clauses++;
+}
+
 bool
-ovsdb_condition_evaluate(const struct ovsdb_row *row,
-                         const struct ovsdb_condition *cnd)
+ovsdb_condition_match_every_clause(const struct ovsdb_row *row,
+                                   const struct ovsdb_condition *cnd)
 {
     size_t i;
 
     for (i = 0; i < cnd->n_clauses; i++) {
-        if (!ovsdb_clause_evaluate(row, &cnd->clauses[i])) {
+        if (!ovsdb_clause_evaluate(row->fields, &cnd->clauses[i], NULL)) {
             return false;
         }
     }
 
     return true;
+}
+
+/* Returns true if condition evaluation of one of the clauses is
+ * true. index_map[] is an optional array that if exists indicates a mapping
+ * between indexing row_datum to the indexes in ovsdb_column */
+bool
+ovsdb_condition_match_any_clause(const struct ovsdb_datum *row_datum,
+                                 const struct ovsdb_condition *cnd,
+                                 unsigned int index_map[])
+{
+    size_t i;
+
+    for (i = 0; i < cnd->n_clauses; i++) {
+        if (ovsdb_clause_evaluate(row_datum, &cnd->clauses[i], index_map)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void
@@ -303,4 +394,108 @@ ovsdb_condition_destroy(struct ovsdb_condition *cnd)
         ovsdb_clause_free(&cnd->clauses[i]);
     }
     free(cnd->clauses);
+    cnd->n_clauses = 0;
+}
+
+void
+ovsdb_condition_init(struct ovsdb_condition *cnd)
+{
+    cnd->clauses = NULL;
+    cnd->n_clauses = 0;
+    memset(cnd->functions, 0, BITMAP_N_LONGS(OVSDB_F_LAST));
+}
+
+bool
+ovsdb_condition_empty(const struct ovsdb_condition *cnd)
+{
+    return cnd->n_clauses == 0;
+}
+
+int
+ovsdb_condition_cmp_3way(const struct ovsdb_condition *a,
+                         const struct ovsdb_condition *b)
+{
+    size_t i;
+    int res;
+
+    if (a->n_clauses != b->n_clauses) {
+        return a->n_clauses < b->n_clauses ? -1 : 1;
+    }
+
+    /* We assume clauses are sorted */
+    for (i = 0; i < a->n_clauses; i++) {
+        res = (compare_clauses_3way_with_data(&a->clauses[i], &b->clauses[i]));
+        if (res != 0) {
+            return res;
+        }
+    }
+
+    return 0;
+}
+
+void
+ovsdb_condition_clone(struct ovsdb_condition *to,
+                      const struct ovsdb_condition *from)
+{
+    size_t i;
+
+    to->clauses = xzalloc(from->n_clauses * sizeof *to->clauses);
+
+    for (i = 0; i < from->n_clauses; i++) {
+        ovsdb_clause_clone(&to->clauses[i], &from->clauses[i]);
+    }
+    to->n_clauses = from->n_clauses;
+}
+
+/* Return true if ovsdb_condition_match_any_clause() will return true on
+ * any row */
+bool
+ovsdb_condition_is_true(const struct ovsdb_condition *cond)
+{
+    return (!cond->n_clauses ||
+       (cond->n_clauses >= 1 && (cond->clauses[0].function == OVSDB_F_TRUE)) ||
+       (cond->n_clauses >= 2 && (cond->clauses[1].function == OVSDB_F_TRUE)));
+}
+
+bool
+ovsdb_condition_is_false(const struct ovsdb_condition *cond)
+{
+    return ((cond->n_clauses == 1) &&
+            (cond->clauses[0].function == OVSDB_F_FALSE));
+ }
+
+/* Assume a and b are sorted, added and removed intitialized. return added
+ * contains clauses that are in b and not in a and removed contains clauses
+ * that are in a and not in b */
+void
+ovsdb_condition_diff(const struct ovsdb_condition *a,
+                     const struct ovsdb_condition *b,
+                     struct ovsdb_condition *b_only,
+                     struct ovsdb_condition *a_only)
+{
+    int i,j;
+    size_t added_allocated = 0, removed_allocated = 0;
+    ovs_assert(!a_only->n_clauses && !b_only->n_clauses);
+
+    for (i = j = 0; i < a->n_clauses && j < b->n_clauses;) {
+        int res = compare_clauses_3way_with_data(&a->clauses[i],
+                                                 &b->clauses[j]);
+
+        if (!res) {
+            i++;
+            j++;
+        } else if (res < 0) {
+            ovsdb_clause_add(a_only, &a->clauses[i], &removed_allocated);
+            i++;
+        } else {
+            ovsdb_clause_add(b_only, &b->clauses[j], &added_allocated);
+            j++;
+        }
+    }
+    for (;i < a->n_clauses; i++) {
+        ovsdb_clause_add(a_only, &a->clauses[i], &removed_allocated);
+    }
+    for(;j < b->n_clauses; j++) {
+        ovsdb_clause_add(b_only, &b->clauses[j], &added_allocated);
+    }
 }

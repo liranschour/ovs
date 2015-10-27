@@ -851,8 +851,11 @@ do_parse_conditions(struct ovs_cmdl_context *ctx)
     exit(exit_code);
 }
 
+#define OVSDB_CONDITION_AND 0
+#define OVSDB_CONDITION_OR 1
+
 static void
-do_evaluate_conditions(struct ovs_cmdl_context *ctx)
+do_evaluate_condition__(struct ovs_cmdl_context *ctx, int mode)
 {
     struct ovsdb_table_schema *ts;
     struct ovsdb_table *table;
@@ -900,7 +903,15 @@ do_evaluate_conditions(struct ovs_cmdl_context *ctx)
     for (i = 0; i < n_conditions; i++) {
         printf("condition %2"PRIuSIZE":", i);
         for (j = 0; j < n_rows; j++) {
-            bool result = ovsdb_condition_evaluate(rows[j], &conditions[i]);
+            bool result;
+            if (mode == OVSDB_CONDITION_AND) {
+                result = ovsdb_condition_match_every_clause(rows[j],
+                                                  &conditions[i]);
+            } else {
+                result = ovsdb_condition_match_any_clause(rows[j]->fields,
+                                                          &conditions[i],
+                                                          NULL);
+            }
             if (j % 5 == 0) {
                 putchar(' ');
             }
@@ -917,6 +928,61 @@ do_evaluate_conditions(struct ovs_cmdl_context *ctx)
         ovsdb_row_destroy(rows[i]);
     }
     free(rows);
+    ovsdb_table_destroy(table); /* Also destroys 'ts'. */
+}
+
+static void
+do_evaluate_conditions(struct ovs_cmdl_context *ctx)
+{
+    do_evaluate_condition__(ctx, OVSDB_CONDITION_AND);
+}
+
+static void
+do_evaluate_conditions_or(struct ovs_cmdl_context *ctx)
+{
+    do_evaluate_condition__(ctx, OVSDB_CONDITION_OR);
+}
+
+static void
+do_compare_conditions(struct ovs_cmdl_context *ctx)
+{
+    struct ovsdb_table_schema *ts;
+    struct ovsdb_table *table;
+    struct ovsdb_condition *conditions;
+    size_t n_conditions;
+    struct json *json;
+    size_t i;
+
+    /* Parse table schema, create table. */
+    json = unbox_json(parse_json(ctx->argv[1]));
+    check_ovsdb_error(ovsdb_table_schema_from_json(json, "mytable", &ts));
+    json_destroy(json);
+
+    table = ovsdb_table_create(ts);
+
+    /* Parse conditions. */
+    json = parse_json(ctx->argv[2]);
+    if (json->type != JSON_ARRAY) {
+        ovs_fatal(0, "CONDITION argument is not JSON array");
+    }
+    n_conditions = json->u.array.n;
+    conditions = xmalloc(n_conditions * sizeof *conditions);
+
+    for (i = 0; i < n_conditions; i++) {
+        check_ovsdb_error(ovsdb_condition_from_json(ts, json->u.array.elems[i],
+                                                    NULL, &conditions[i]));
+    }
+    json_destroy(json);
+
+    for (i = 0; i < n_conditions - 1; i++) {
+        int res = ovsdb_condition_cmp_3way(&conditions[i], &conditions[i + 1]);
+        printf("condition %ld-%ld: %d\n", i, i + 1, res);
+    }
+
+    for (i = 0; i < n_conditions; i++) {
+        ovsdb_condition_destroy(&conditions[i]);
+    }
+    free(conditions);
     ovsdb_table_destroy(table); /* Also destroys 'ts'. */
 }
 
@@ -2197,6 +2263,8 @@ static struct ovs_cmdl_command all_commands[] = {
     { "compare-rows", NULL, 2, INT_MAX, do_compare_rows },
     { "parse-conditions", NULL, 2, INT_MAX, do_parse_conditions },
     { "evaluate-conditions", NULL, 3, 3, do_evaluate_conditions },
+    { "evaluate-conditions-or", NULL, 3, 3, do_evaluate_conditions_or },
+    { "compare-conditions", NULL, 2, 2, do_compare_conditions },
     { "parse-mutations", NULL, 2, INT_MAX, do_parse_mutations },
     { "execute-mutations", NULL, 3, 3, do_execute_mutations },
     { "query", NULL, 3, 3, do_query },

@@ -27,6 +27,8 @@ struct ovsdb_row;
 /* These list is ordered in ascending order of the fraction of tables row that
  * they are (heuristically) expected to leave in query results. */
 #define OVSDB_FUNCTIONS                         \
+    OVSDB_FUNCTION(OVSDB_F_FALSE, "false")            \
+    OVSDB_FUNCTION(OVSDB_F_TRUE, "true")              \
     OVSDB_FUNCTION(OVSDB_F_EQ, "==")                  \
     OVSDB_FUNCTION(OVSDB_F_INCLUDES, "includes")      \
     OVSDB_FUNCTION(OVSDB_F_LE, "<=")                  \
@@ -50,6 +52,7 @@ const char *ovsdb_function_to_string(enum ovsdb_function);
 struct ovsdb_clause {
     enum ovsdb_function function;
     const struct ovsdb_column *column;
+    unsigned int index;
     struct ovsdb_datum arg;
 };
 
@@ -60,6 +63,8 @@ struct ovsdb_condition {
 
 #define OVSDB_CONDITION_INITIALIZER { NULL, 0 }
 
+void ovsdb_condition_init(struct ovsdb_condition *);
+bool ovsdb_condition_empty(const struct ovsdb_condition *);
 struct ovsdb_error *ovsdb_condition_from_json(
     const struct ovsdb_table_schema *,
     const struct json *, struct ovsdb_symbol_table *,
@@ -68,5 +73,20 @@ struct json *ovsdb_condition_to_json(const struct ovsdb_condition *);
 void ovsdb_condition_destroy(struct ovsdb_condition *);
 bool ovsdb_condition_evaluate(const struct ovsdb_row *,
                               const struct ovsdb_condition *);
+bool ovsdb_condition_evaluate_or_datum(const struct ovsdb_datum *,
+                                       const struct ovsdb_condition *,
+                                       unsigned int index_map[]);
+int ovsdb_condition_cmp(const struct ovsdb_condition *a,
+                        const struct ovsdb_condition *b);
+void ovsdb_condition_clone(struct ovsdb_condition *to,
+                           const struct ovsdb_condition *from);
+bool ovsdb_condition_is_true(const struct ovsdb_condition *cond);
+bool ovsdb_condition_is_false(const struct ovsdb_condition *cond);
+enum ovsdb_function ovsdb_condition_max_function(
+                                  const struct ovsdb_condition *cond);
+void ovsdb_conditon_diff(const struct ovsdb_condition *a,
+                         const struct ovsdb_condition *b,
+                         struct ovsdb_condition *added,
+                         struct ovsdb_condition *removed);
 
 #endif /* ovsdb/condition.h */

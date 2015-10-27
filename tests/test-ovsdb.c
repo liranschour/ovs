@@ -851,8 +851,11 @@ do_parse_conditions(struct ovs_cmdl_context *ctx)
     exit(exit_code);
 }
 
+#define OVSDB_CONDITION_AND 0
+#define OVSDB_CONDITION_OR 1
+
 static void
-do_evaluate_conditions(struct ovs_cmdl_context *ctx)
+do_evaluate_condition__(struct ovs_cmdl_context *ctx, int mode)
 {
     struct ovsdb_table_schema *ts;
     struct ovsdb_table *table;
@@ -900,7 +903,15 @@ do_evaluate_conditions(struct ovs_cmdl_context *ctx)
     for (i = 0; i < n_conditions; i++) {
         printf("condition %2"PRIuSIZE":", i);
         for (j = 0; j < n_rows; j++) {
-            bool result = ovsdb_condition_evaluate(rows[j], &conditions[i]);
+            bool result;
+            if (mode == OVSDB_CONDITION_AND) {
+                result = ovsdb_condition_evaluate(rows[j],
+                                                  &conditions[i]);
+            } else {
+                result = ovsdb_condition_evaluate_or_datum(rows[j]->fields,
+                                                           &conditions[i],
+                                                           false);
+            }
             if (j % 5 == 0) {
                 putchar(' ');
             }
@@ -918,6 +929,18 @@ do_evaluate_conditions(struct ovs_cmdl_context *ctx)
     }
     free(rows);
     ovsdb_table_destroy(table); /* Also destroys 'ts'. */
+}
+
+static void
+do_evaluate_conditions(struct ovs_cmdl_context *ctx)
+{
+    do_evaluate_condition__(ctx, OVSDB_CONDITION_AND);
+}
+
+static void
+do_evaluate_conditions_or(struct ovs_cmdl_context *ctx)
+{
+    do_evaluate_condition__(ctx, OVSDB_CONDITION_OR);
 }
 
 static void
@@ -2197,6 +2220,7 @@ static struct ovs_cmdl_command all_commands[] = {
     { "compare-rows", NULL, 2, INT_MAX, do_compare_rows },
     { "parse-conditions", NULL, 2, INT_MAX, do_parse_conditions },
     { "evaluate-conditions", NULL, 3, 3, do_evaluate_conditions },
+    { "evaluate-conditions-or", NULL, 3, 3, do_evaluate_conditions_or },
     { "parse-mutations", NULL, 2, INT_MAX, do_parse_mutations },
     { "execute-mutations", NULL, 3, 3, do_execute_mutations },
     { "query", NULL, 3, 3, do_query },

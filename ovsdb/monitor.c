@@ -27,6 +27,7 @@
 #include "ovsdb-parser.h"
 #include "ovsdb.h"
 #include "row.h"
+#include "condition.h"
 #include "simap.h"
 #include "hash.h"
 #include "table.h"
@@ -40,6 +41,21 @@
 
 static const struct ovsdb_replica_class ovsdb_jsonrpc_replica_class;
 static struct hmap ovsdb_monitors = HMAP_INITIALIZER(&ovsdb_monitors);
+
+/* Keep state of session's conditions */
+struct ovsdb_monitor_session_condition {
+    bool mode;
+    size_t n_true_cnd;
+    struct shash tables;     /* Contains
+                              *   "struct ovsdb_monitor_table_condition *"s. */
+};
+
+/* Monitored table session's conditions */
+struct ovsdb_monitor_table_condition {
+    const struct ovsdb_table *table;
+    struct ovsdb_condition old_condition;
+    struct ovsdb_condition new_condition;
+};
 
 /*  Backend monitor.
  *
@@ -108,6 +124,7 @@ struct ovsdb_monitor_changes {
 /* A particular table being monitored. */
 struct ovsdb_monitor_table {
     const struct ovsdb_table *table;
+    const struct ovsdb_monitor *dbmon;
 
     /* This is the union (bitwise-OR) of the 'select' values in all of the
      * members of 'columns' below. */
@@ -129,9 +146,11 @@ struct ovsdb_monitor_table {
 };
 
 typedef struct json *
-(*compose_row_update_cb_func)(const struct ovsdb_monitor_table *mt,
-                              const struct ovsdb_monitor_row *row,
-                              bool initial, unsigned long int *changed);
+(*compose_row_update_cb_func)
+    (const struct ovsdb_monitor_table *mt,
+     const struct ovsdb_monitor_session_condition * condition,
+     const struct ovsdb_monitor_row *row,
+     bool initial, unsigned long int *changed);
 
 static void ovsdb_monitor_destroy(struct ovsdb_monitor *dbmon);
 static struct ovsdb_monitor_changes * ovsdb_monitor_table_add_changes(
@@ -372,6 +391,7 @@ ovsdb_monitor_add_table(struct ovsdb_monitor *m,
 
     mt = xzalloc(sizeof *mt);
     mt->table = table;
+    mt->dbmon = m;
     shash_add(&m->tables, table->schema->name, mt);
     hmap_init(&mt->changes);
     mt->columns_index_map =
@@ -390,8 +410,19 @@ ovsdb_monitor_add_column(struct ovsdb_monitor *dbmon,
 {
     struct ovsdb_monitor_table *mt;
     struct ovsdb_monitor_column *c;
+    int i;
 
     mt = shash_find_data(&dbmon->tables, table->schema->name);
+
+    /* Check duplication only for non-monitored columns */
+    if (!monitored) {
+        for (i = 0; i < mt->n_columns; i++) {
+            if (mt->columns[i].column == column) {
+                /* column exists */
+                return;
+            }
+        }
+    }
 
     if (mt->n_columns >= mt->allocated_columns) {
         mt->columns = x2nrealloc(mt->columns, &mt->allocated_columns,
@@ -418,6 +449,39 @@ ovsdb_monitor_add_column(struct ovsdb_monitor *dbmon,
     c->monitored = monitored;
     if (monitored) {
         mt->n_monitored_columns++;
+    }
+}
+
+static void
+ovsdb_monitor_condition_add_columns(struct ovsdb_monitor *dbmon,
+                                    const struct ovsdb_table *table,
+                                    struct ovsdb_condition *condition)
+{
+    size_t n_columns;
+    int i;
+    const struct ovsdb_column **columns =
+        ovsdb_condition_get_columns(condition, &n_columns);
+
+    for (i = 0; i < n_columns; i++) {
+        ovsdb_monitor_add_column(dbmon, table, columns[i],
+                                 OJMS_NONE, false);
+    }
+    if (n_columns) {
+        free(columns);
+    }
+}
+
+void
+ovsdb_monitor_add_all_condition_columns(
+                          struct ovsdb_monitor *dbmon,
+                          struct ovsdb_monitor_session_condition *cond)
+{
+    struct shash_node *node;
+
+    SHASH_FOR_EACH(node, &cond->tables) {
+        struct ovsdb_monitor_table_condition *mtc = node->data;
+
+        ovsdb_monitor_condition_add_columns(dbmon, mtc->table, &mtc->new_condition);
     }
 }
 
@@ -531,6 +595,157 @@ ovsdb_monitor_row_update_type(bool initial, const bool old, const bool new)
             : !new ? OJMS_DELETE
             : OJMS_MODIFY;
 }
+
+/* Set conditional monitoring mode only if we have none empty condition in one of the
+ * tables at least */
+static inline void
+ovsdb_monitor_session_condition_set_mode(
+                                   struct ovsdb_monitor_session_condition *cond)
+{
+    cond->mode = shash_count(&cond->tables) !=
+        cond->n_true_cnd;
+}
+
+/* Returnes an empty allocated session's condition state holder */
+struct ovsdb_monitor_session_condition *
+ovsdb_monitor_session_condition_create(void)
+{
+    struct ovsdb_monitor_session_condition *condition = xzalloc(sizeof *condition);
+
+    condition->mode = false;
+    shash_init(&condition->tables);
+    return condition;
+}
+
+void
+ovsdb_monitor_session_condition_destroy(
+                           struct ovsdb_monitor_session_condition *condition)
+{
+    struct shash_node *node, *next;
+
+    SHASH_FOR_EACH_SAFE (node, next, &condition->tables) {
+        struct ovsdb_monitor_table_condition *mtc = node->data;
+
+        ovsdb_condition_destroy(&mtc->new_condition);
+        ovsdb_condition_destroy(&mtc->old_condition);
+        shash_delete(&condition->tables, node);
+        free(mtc);
+    }
+    free(condition);
+}
+
+struct ovsdb_error *
+ovsdb_monitor_table_condition_set(
+                         struct ovsdb_monitor_session_condition *condition,
+                         const struct ovsdb_table *table,
+                         const struct json *json_cnd)
+{
+    struct ovsdb_monitor_table_condition *mtc;
+    struct ovsdb_error *error;
+
+    mtc = xzalloc(sizeof *mtc);
+    mtc->table = table;
+    ovsdb_condition_init(&mtc->old_condition);
+    ovsdb_condition_init(&mtc->new_condition);
+
+    if (json_cnd) {
+        error = ovsdb_condition_from_json(table->schema,
+                                          json_cnd,
+                                          NULL,
+                                          &mtc->old_condition);
+        if (error) {
+            free(mtc);
+            return ovsdb_syntax_error(json_cnd,
+                                      NULL, "array of conditions expected");
+        }
+    }
+
+    shash_add(&condition->tables, table->schema->name, mtc);
+    /* On session startup old == new condition */
+    ovsdb_condition_clone(&mtc->new_condition, &mtc->old_condition);
+    if (ovsdb_condition_is_true(&mtc->old_condition)) {
+        condition->n_true_cnd++;
+        ovsdb_monitor_session_condition_set_mode(condition);
+    }
+
+    return NULL;
+}
+
+static bool
+ovsdb_monitor_get_table_conditions(
+                      const struct ovsdb_monitor_table *mt,
+                      const struct ovsdb_monitor_session_condition *condition,
+                      struct ovsdb_condition **old_condition,
+                      struct ovsdb_condition **new_condition)
+{
+    if (!condition) {
+        return false;
+    }
+
+    struct ovsdb_monitor_table_condition *mtc =
+        shash_find_data(&condition->tables, mt->table->schema->name);
+
+    if (!mtc) {
+        return false;
+    }
+    *old_condition = &mtc->old_condition;
+    *new_condition = &mtc->new_condition;
+
+    return true;
+}
+
+static enum ovsdb_monitor_selection
+ovsdb_monitor_row_update_type_condition(
+                      const struct ovsdb_monitor_table *mt,
+                      const struct ovsdb_monitor_session_condition *condition,
+                      bool initial,
+                      const struct ovsdb_datum *old,
+                      const struct ovsdb_datum *new)
+{
+    struct ovsdb_condition *old_condition, *new_condition;
+    enum ovsdb_monitor_selection type =
+        ovsdb_monitor_row_update_type(initial, old, new);
+
+    if (ovsdb_monitor_get_table_conditions(mt,
+                                           condition,
+                                           &old_condition,
+                                           &new_condition)) {
+        bool old_cond = !old ? false
+            : ovsdb_condition_evaluate_or_datum(old,
+                                                old_condition,
+                                                mt->columns_index_map);
+        bool new_cond = !new ? false
+            : ovsdb_condition_evaluate_or_datum(new,
+                                                new_condition,
+                                                mt->columns_index_map);
+
+        if (!old_cond && !new_cond) {
+            type = OJMS_NONE;
+        }
+
+        switch (type) {
+        case OJMS_INITIAL:
+        case OJMS_INSERT:
+            if (!new_cond) {
+                type = OJMS_NONE;
+            }
+            break;
+        case OJMS_MODIFY:
+            type = !old_cond ? OJMS_INSERT : !new_cond
+                ? OJMS_DELETE : OJMS_MODIFY;
+            break;
+        case OJMS_DELETE:
+            if (!old_cond) {
+                type = OJMS_NONE;
+            }
+            break;
+        case OJMS_NONE:
+            break;
+        }
+    }
+    return type;
+}
+
 static bool
 ovsdb_monitor_row_skip_update(const struct ovsdb_monitor_table *mt,
                               const struct ovsdb_monitor_row *row,
@@ -575,6 +790,7 @@ ovsdb_monitor_row_skip_update(const struct ovsdb_monitor_table *mt,
 static struct json *
 ovsdb_monitor_compose_row_update(
     const struct ovsdb_monitor_table *mt,
+    const struct ovsdb_monitor_session_condition *condition OVS_UNUSED,
     const struct ovsdb_monitor_row *row,
     bool initial, unsigned long int *changed)
 {
@@ -636,6 +852,7 @@ ovsdb_monitor_compose_row_update(
 static struct json *
 ovsdb_monitor_compose_row_update2(
     const struct ovsdb_monitor_table *mt,
+    const struct ovsdb_monitor_session_condition *condition,
     const struct ovsdb_monitor_row *row,
     bool initial, unsigned long int *changed)
 {
@@ -643,7 +860,8 @@ ovsdb_monitor_compose_row_update2(
     struct json *row_update2, *diff_json;
     size_t i;
 
-    type = ovsdb_monitor_row_update_type(initial, row->old, row->new);
+    type = ovsdb_monitor_row_update_type_condition(mt, condition, initial,
+                                                   row->old, row->new);
     if (ovsdb_monitor_row_skip_update(mt, row, type, changed)) {
         return NULL;
     }
@@ -713,9 +931,11 @@ ovsdb_monitor_max_columns(struct ovsdb_monitor *dbmon)
  * RFC 7047) for all the outstanding changes within 'monitor', starting from
  * 'transaction'.  */
 static struct json*
-ovsdb_monitor_compose_update(struct ovsdb_monitor *dbmon,
-                             bool initial, uint64_t transaction,
-                             compose_row_update_cb_func row_update)
+ovsdb_monitor_compose_update(
+                      struct ovsdb_monitor *dbmon,
+                      bool initial, uint64_t transaction,
+                      const struct ovsdb_monitor_session_condition *condition,
+                      compose_row_update_cb_func row_update)
 {
     struct shash_node *node;
     struct json *json;
@@ -737,7 +957,7 @@ ovsdb_monitor_compose_update(struct ovsdb_monitor *dbmon,
         HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
             struct json *row_json;
 
-            row_json = (*row_update)(mt, row, initial, changed);
+            row_json = (*row_update)(mt, condition, row, initial, changed);
             if (row_json) {
                 char uuid[UUID_LEN + 1];
 
@@ -771,11 +991,13 @@ ovsdb_monitor_compose_update(struct ovsdb_monitor *dbmon,
  * be used as part of the initial reply to a "monitor" request, false if it is
  * going to be used as part of an "update" notification. */
 struct json *
-ovsdb_monitor_get_update(struct ovsdb_monitor *dbmon,
-                         bool initial, uint64_t *unflushed,
-                         enum ovsdb_monitor_version version)
+ovsdb_monitor_get_update(
+             struct ovsdb_monitor *dbmon,
+             bool initial, uint64_t *unflushed,
+             const struct ovsdb_monitor_session_condition *condition,
+             enum ovsdb_monitor_version version)
 {
-    struct ovsdb_monitor_json_cache_node *cache_node;
+    struct ovsdb_monitor_json_cache_node *cache_node = NULL;
     struct shash_node *node;
     struct json *json;
     uint64_t prev_txn = *unflushed;
@@ -783,19 +1005,27 @@ ovsdb_monitor_get_update(struct ovsdb_monitor *dbmon,
 
     /* Return a clone of cached json if one exists. Otherwise,
      * generate a new one and add it to the cache.  */
-    cache_node = ovsdb_monitor_json_cache_search(dbmon, version, prev_txn);
+    if (!condition || !condition->mode) {
+        cache_node = ovsdb_monitor_json_cache_search(dbmon, version, prev_txn);
+    }
     if (cache_node) {
         json = cache_node->json ? json_clone(cache_node->json) : NULL;
     } else {
         if (version == OVSDB_MONITOR_V1) {
-            json = ovsdb_monitor_compose_update(dbmon, initial, prev_txn,
-                                        ovsdb_monitor_compose_row_update);
+            json =
+               ovsdb_monitor_compose_update(dbmon, initial, prev_txn,
+                                            condition,
+                                            ovsdb_monitor_compose_row_update);
         } else {
             ovs_assert(version == OVSDB_MONITOR_V2);
-            json = ovsdb_monitor_compose_update(dbmon, initial, prev_txn,
-                                        ovsdb_monitor_compose_row_update2);
+            json =
+               ovsdb_monitor_compose_update(dbmon, initial, prev_txn,
+                                            condition,
+                                            ovsdb_monitor_compose_row_update2);
         }
-        ovsdb_monitor_json_cache_insert(dbmon, version, prev_txn, json);
+        if (!condition || !condition->mode) {
+            ovsdb_monitor_json_cache_insert(dbmon, version, prev_txn, json);
+        }
     }
 
     /* Maintain transaction id of 'changes'. */
@@ -931,6 +1161,11 @@ ovsdb_monitor_changes_classify(enum ovsdb_monitor_selection type,
     if (type == OJMS_MODIFY &&
         !ovsdb_monitor_columns_changed(mt, changed)) {
         return OVSDB_CHANGES_NO_EFFECT;
+    }
+
+    if (type == OJMS_MODIFY) {
+        /* Condition might turn a modify operation to insert or delete */
+        type |= OJMS_INSERT | OJMS_DELETE;
     }
 
     return (mt->select & type)

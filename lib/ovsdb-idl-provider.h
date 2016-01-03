@@ -51,6 +51,18 @@ struct ovsdb_idl_column {
     void (*unparse)(struct ovsdb_idl_row *);
 };
 
+struct ovsdb_idl_condition {
+    const struct ovsdb_idl_table_class *tc;
+    struct ovs_list clauses;
+};
+
+struct ovsdb_idl_clause {
+    struct ovs_list node;
+    enum ovsdb_idl_function function;
+    const struct ovsdb_idl_column *column;
+    struct ovsdb_datum arg;
+};
+
 struct ovsdb_idl_table_class {
     char *name;
     bool is_root;
@@ -70,6 +82,7 @@ struct ovsdb_idl_table {
     struct ovsdb_idl *idl;   /* Containing idl. */
     unsigned int change_seqno[OVSDB_IDL_CHANGE_MAX];
     struct ovs_list track_list; /* Tracked rows (ovsdb_idl_row.track_node). */
+    struct ovsdb_idl_condition condition;
 };
 
 struct ovsdb_idl_class {

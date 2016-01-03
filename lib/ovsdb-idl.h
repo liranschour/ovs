@@ -45,6 +45,7 @@ struct ovsdb_idl_class;
 struct ovsdb_idl_row;
 struct ovsdb_idl_column;
 struct ovsdb_idl_table_class;
+struct ovsdb_idl_condition;
 struct uuid;
 
 struct ovsdb_idl *ovsdb_idl_create(const char *remote,
@@ -277,4 +278,41 @@ void ovsdb_idl_loop_destroy(struct ovsdb_idl_loop *);
 struct ovsdb_idl_txn *ovsdb_idl_loop_run(struct ovsdb_idl_loop *);
 void ovsdb_idl_loop_commit_and_wait(struct ovsdb_idl_loop *);
 
+/* These list is ordered in ascending order of the fraction of tables row that
+ * they are (heuristically) expected to leave in query results. */
+#define OVSDB_IDL_FUNCTIONS                         \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_FALSE, "false")            \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_TRUE, "true")              \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_EQ, "==")                  \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_INCLUDES, "includes")      \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_LE, "<=")                  \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_LT, "<")                   \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_GE, ">=")                  \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_GT, ">")                   \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_EXCLUDES, "excludes")      \
+    OVSDB_IDL_FUNCTION(OVSDB_IDL_F_NE, "!=")
+
+enum ovsdb_idl_function {
+#define OVSDB_IDL_FUNCTION(ENUM, NAME) ENUM,
+    OVSDB_IDL_FUNCTIONS
+#undef OVSDB_IDL_FUNCTION
+};
+
+void ovsdb_idl_condition_init(struct ovsdb_idl_condition *cnd,
+                              const struct ovsdb_idl_table_class *tc);
+void ovsdb_idl_condition_destroy(struct ovsdb_idl_condition *cnd);
+void ovsdb_idl_condition_add_clause(struct ovsdb_idl_condition *cnd,
+                                    enum ovsdb_idl_function function,
+                                    const struct ovsdb_idl_column *column,
+                                    struct ovsdb_datum *arg);
+void ovsdb_idl_condition_remove_clause(struct ovsdb_idl_condition *cnd,
+                                       enum ovsdb_idl_function function,
+                                       const struct ovsdb_idl_column *column,
+                                       struct ovsdb_datum *arg);
+bool ovsdb_idl_cond_update(struct ovsdb_idl *idl,
+                           struct ovsdb_idl_condition *cond);
+
+struct ovsdb_error *
+ovsdb_idl_function_from_string(const char *name,
+                               enum ovsdb_idl_function *function);
 #endif /* ovsdb-idl.h */

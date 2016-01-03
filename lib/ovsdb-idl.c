@@ -262,6 +262,7 @@ ovsdb_idl_create(const char *remote, const struct ovsdb_idl_class *class,
             = table->change_seqno[OVSDB_IDL_CHANGE_MODIFY]
             = table->change_seqno[OVSDB_IDL_CHANGE_DELETE] = 0;
         table->idl = idl;
+        ovsdb_idl_condition_init(&table->condition, tc);
     }
 
     idl->state_seqno = UINT_MAX;
@@ -671,6 +672,203 @@ ovsdb_idl_add_table(struct ovsdb_idl *idl,
     OVS_NOT_REACHED();
 }
 
+struct ovsdb_error *
+ovsdb_idl_function_from_string(const char *name,
+                               enum ovsdb_idl_function *function)
+{
+#define OVSDB_IDL_FUNCTION(ENUM, NAME)              \
+    if (!strcmp(name, NAME)) {                  \
+        *function = ENUM;                       \
+        return NULL;                            \
+    }
+    OVSDB_IDL_FUNCTIONS;
+#undef OVSDB_IDL_FUNCTION
+
+    return ovsdb_syntax_error(NULL, "unknown function",
+                              "No function named %s.", name);
+}
+
+static const char *
+ovsdb_idl_function_to_string(enum ovsdb_idl_function function)
+{
+    switch (function) {
+#define OVSDB_IDL_FUNCTION(ENUM, NAME) case ENUM: return NAME;
+        OVSDB_IDL_FUNCTIONS;
+#undef OVSDB_IDL_FUNCTION
+    }
+
+    return NULL;
+}
+
+static void
+ovsdb_idl_condition_clone(struct ovsdb_idl_condition *a,
+                          struct ovsdb_idl_condition *b)
+{
+    struct ovsdb_idl_clause *c;
+
+    LIST_FOR_EACH(c, node, &b->clauses) {
+        struct ovsdb_idl_clause *clause = xmalloc(sizeof *clause);
+
+        list_init(&clause->node);
+        clause->function = c->function;
+        if (c->function > OVSDB_IDL_F_TRUE) {
+            clause->column = c->column;
+            ovsdb_datum_clone(&clause->arg, &c->arg, &c->column->type);
+        }
+        list_push_back(&a->clauses, &clause->node);
+    }
+}
+
+static struct json *
+ovsdb_idl_clause_to_json(const struct ovsdb_idl_clause *clause)
+{
+    if (clause->function != OVSDB_IDL_F_TRUE &&
+        clause->function != OVSDB_IDL_F_FALSE) {
+        const char *function = ovsdb_idl_function_to_string(clause->function);
+
+        return json_array_create_3(json_string_create(clause->column->name),
+                                   json_string_create(function),
+                                   ovsdb_datum_to_json(&clause->arg,
+                                                       &clause->column->type));
+    }
+
+    return json_boolean_create(clause->function == OVSDB_IDL_F_TRUE ?
+                               true : false);
+}
+
+static void
+ovsdb_idl_clause_free(struct ovsdb_idl_clause *clause)
+{
+    if (clause->function != OVSDB_IDL_F_TRUE &&
+        clause->function != OVSDB_IDL_F_FALSE) {
+        ovsdb_datum_destroy(&clause->arg, &clause->column->type);
+    }
+
+    list_remove(&clause->node);
+    free(clause);
+}
+
+void
+ovsdb_idl_condition_destroy(struct ovsdb_idl_condition *cnd)
+{
+    struct ovsdb_idl_clause *c, *next;
+
+    LIST_FOR_EACH_SAFE (c, next, node, &cnd->clauses) {
+        ovsdb_idl_clause_free(c);
+    }
+}
+
+void
+ovsdb_idl_condition_init(struct ovsdb_idl_condition *cnd,
+                         const struct ovsdb_idl_table_class *tc)
+{
+    cnd->tc = tc;
+    list_init(&cnd->clauses);
+}
+
+void ovsdb_idl_condition_add_clause(struct ovsdb_idl_condition *cnd,
+                                    enum ovsdb_idl_function function,
+                                    const struct ovsdb_idl_column *column,
+                                    struct ovsdb_datum *arg)
+{
+    struct ovsdb_idl_clause *clause = xzalloc(sizeof *clause);
+    const struct ovsdb_type *type = NULL;
+
+    list_init(&clause->node);
+    clause->function = function;
+    clause->column = column;
+    if (column) {
+        type = &column->type;
+    } else {
+        type = &ovsdb_type_boolean;
+    }
+    ovsdb_datum_clone(&clause->arg, arg, type);
+    list_push_back(&cnd->clauses, &clause->node);
+}
+
+void ovsdb_idl_condition_remove_clause(struct ovsdb_idl_condition *cnd,
+                                       enum ovsdb_idl_function function,
+                                       const struct ovsdb_idl_column *column,
+                                       struct ovsdb_datum *arg)
+{
+    struct ovsdb_idl_clause *c, *next;
+
+    LIST_FOR_EACH_SAFE(c, next, node, &cnd->clauses) {
+        if (c->function == function &&
+            (!column || (c->column == column &&
+                         !ovsdb_datum_equals(&c->arg,
+                                             arg, &column->type)))) {
+            ovsdb_idl_clause_free(c);
+        }
+    }
+}
+
+static struct json *
+ovsdb_idl_condition_to_json(const struct ovsdb_idl_condition *cnd)
+{
+    struct json **clauses;
+    size_t i = 0, n_clauses = list_size(&cnd->clauses);
+    struct ovsdb_idl_clause *c;
+
+    clauses = xmalloc(n_clauses * sizeof *clauses);
+    LIST_FOR_EACH (c, node, &cnd->clauses) {
+           clauses[i++] = ovsdb_idl_clause_to_json(c);
+    }
+
+    return json_array_create(clauses, n_clauses);
+}
+
+static void
+ovsdb_idl_send_cond_update__(struct ovsdb_idl *idl,
+                             struct ovsdb_idl_table *table,
+                             const struct ovsdb_idl_condition *cond)
+{
+    char uuid[UUID_LEN + 1];
+    struct json *monitor_cond_update_requests = json_object_create();
+    struct json *monitor_cond_update_request = json_object_create();
+    struct json *cond_json = ovsdb_idl_condition_to_json(cond);
+    struct json *params, *json_uuid;
+    struct jsonrpc_msg *request;
+
+    json_object_put(monitor_cond_update_request, "where", cond_json);
+    json_object_put(monitor_cond_update_requests,
+                    table->class->name,
+                    json_array_create_1(monitor_cond_update_request));
+
+    snprintf(uuid, sizeof uuid, UUID_FMT,
+             UUID_ARGS(&idl->uuid));
+    json_uuid = json_string_create(uuid);
+
+    /* Create a new uuid */
+    uuid_generate(&idl->uuid);
+    snprintf(uuid, sizeof uuid, UUID_FMT,
+             UUID_ARGS(&idl->uuid));
+    params = json_array_create_3(json_uuid, json_string_create(uuid),
+                                 monitor_cond_update_requests);
+
+    request = jsonrpc_create_request("monitor_cond_update", params, NULL);
+    jsonrpc_session_send(idl->session, request);
+}
+
+/* Add conditions to the replicated tables. Ensure that tables are added to the
+ * replication.
+ */
+bool
+ovsdb_idl_cond_update(struct ovsdb_idl *idl,
+                      struct ovsdb_idl_condition *cond)
+{
+    struct ovsdb_idl_table *table;
+
+    table = ovsdb_idl_table_from_class(idl, cond->tc);
+
+    if (jsonrpc_session_is_connected(idl->session)) {
+        ovsdb_idl_send_cond_update__(idl, table, cond);
+    } else {
+        ovsdb_idl_condition_clone(&table->condition, cond);
+    }
+    return true;
+}
+
 /* Turns off OVSDB_IDL_ALERT for 'column' in 'idl'.
  *
  * This function should be called between ovsdb_idl_create() and the first call
@@ -970,7 +1168,7 @@ ovsdb_idl_send_monitor_request__(struct ovsdb_idl *idl,
     for (i = 0; i < idl->class->n_tables; i++) {
         const struct ovsdb_idl_table *table = &idl->tables[i];
         const struct ovsdb_idl_table_class *tc = table->class;
-        struct json *monitor_request, *columns;
+        struct json *monitor_request, *columns, *where;
         const struct sset *table_schema;
         size_t j;
 
@@ -1008,6 +1206,11 @@ ovsdb_idl_send_monitor_request__(struct ovsdb_idl *idl,
 
             monitor_request = json_object_create();
             json_object_put(monitor_request, "columns", columns);
+            if (!strcmp(method, "monitor_cond") &&
+                list_size(&table->condition.clauses) > 0) {
+                where = ovsdb_idl_condition_to_json(&table->condition);
+                json_object_put(monitor_request, "where", where);
+            }
             json_object_put(monitor_requests, tc->name, monitor_request);
         }
     }

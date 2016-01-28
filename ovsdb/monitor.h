@@ -58,7 +58,7 @@ void ovsdb_monitor_add_column(struct ovsdb_monitor *dbmon,
                               const struct ovsdb_table *table,
                               const struct ovsdb_column *column,
                               enum ovsdb_monitor_selection select,
-                              size_t *allocated_columns);
+                              bool monitored);
 
 const char * OVS_WARN_UNUSED_RESULT
 ovsdb_monitor_table_check_duplicates(struct ovsdb_monitor *,

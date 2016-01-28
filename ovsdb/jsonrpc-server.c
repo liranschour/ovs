@@ -1093,8 +1093,7 @@ parse_bool(struct ovsdb_parser *parser, const char *name, bool default_value)
 static struct ovsdb_error * OVS_WARN_UNUSED_RESULT
 ovsdb_jsonrpc_parse_monitor_request(struct ovsdb_monitor *dbmon,
                                     const struct ovsdb_table *table,
-                                    const struct json *monitor_request,
-                                    size_t *allocated_columns)
+                                    const struct json *monitor_request)
 {
     const struct ovsdb_table_schema *ts = table->schema;
     enum ovsdb_monitor_selection select;
@@ -1158,8 +1157,8 @@ ovsdb_jsonrpc_parse_monitor_request(struct ovsdb_monitor *dbmon,
                 return ovsdb_syntax_error(columns, NULL, "%s is not a valid "
                                           "column name", s);
             }
-            ovsdb_monitor_add_column(dbmon, table, column, select,
-                                     allocated_columns);
+            ovsdb_monitor_add_column(dbmon, table, column,
+                                     select, true);
         }
     } else {
         struct shash_node *node;
@@ -1167,8 +1166,8 @@ ovsdb_jsonrpc_parse_monitor_request(struct ovsdb_monitor *dbmon,
         SHASH_FOR_EACH (node, &ts->columns) {
             const struct ovsdb_column *column = node->data;
             if (column->index != OVSDB_COL_UUID) {
-                ovsdb_monitor_add_column(dbmon, table, column, select,
-                                         allocated_columns);
+                ovsdb_monitor_add_column(dbmon, table, column,
+                                         select, true);
             }
         }
     }
@@ -1218,7 +1217,6 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
     SHASH_FOR_EACH (node, json_object(monitor_requests)) {
         const struct ovsdb_table *table;
         const char *column_name;
-        size_t allocated_columns;
         const struct json *mr_value;
         size_t i;
 
@@ -1233,20 +1231,21 @@ ovsdb_jsonrpc_monitor_create(struct ovsdb_jsonrpc_session *s, struct ovsdb *db,
 
         /* Parse columns. */
         mr_value = node->data;
-        allocated_columns = 0;
         if (mr_value->type == JSON_ARRAY) {
             const struct json_array *array = &mr_value->u.array;
 
             for (i = 0; i < array->n; i++) {
-                error = ovsdb_jsonrpc_parse_monitor_request(
-                    m->dbmon, table, array->elems[i], &allocated_columns);
+                error = ovsdb_jsonrpc_parse_monitor_request(m->dbmon,
+                                                            table,
+                                                            array->elems[i]);
                 if (error) {
                     goto error;
                 }
             }
         } else {
-            error = ovsdb_jsonrpc_parse_monitor_request(
-                m->dbmon, table, mr_value, &allocated_columns);
+            error = ovsdb_jsonrpc_parse_monitor_request(m->dbmon,
+                                                        table,
+                                                        mr_value);
             if (error) {
                 goto error;
             }

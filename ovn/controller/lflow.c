@@ -210,10 +210,22 @@ ldp_create(const struct sbrec_datapath_binding *binding)
 }
 
 static struct logical_datapath *
-ldp_lookup_or_create(const struct sbrec_datapath_binding *binding)
+ldp_lookup_or_create(struct controller_ctx *ctx,
+                     const struct sbrec_datapath_binding *binding)
 {
     struct logical_datapath *ldp = ldp_lookup(binding);
-    return ldp ? ldp : ldp_create(binding);
+
+     if (!ldp) {
+        ldp = ldp_create(binding);
+        VLOG_INFO("add logical datapath "UUID_FMT, UUID_ARGS(&ldp->uuid));
+        sbrec_port_binding_add_clause_datapath(ctx->binding_cond,
+                                               OVSDB_IDL_F_EQ, binding);
+        sbrec_logical_flow_add_clause_logical_datapath(ctx->lflow_cond,
+                                                       OVSDB_IDL_F_EQ, binding);
+        ctx->binding_cond_updated = true;
+        ctx->lflow_cond_updated = true;
+     }
+    return ldp;
 }
 
 static void
@@ -237,20 +249,34 @@ ldp_run(struct controller_ctx *ctx)
 
     const struct sbrec_port_binding *binding;
     SBREC_PORT_BINDING_FOR_EACH (binding, ctx->ovnsb_idl) {
-        struct logical_datapath *ldp = ldp_lookup_or_create(binding->datapath);
+        struct logical_datapath *ldp = ldp_lookup_or_create(ctx, binding->datapath);
 
         simap_put(&ldp->ports, binding->logical_port, binding->tunnel_key);
     }
 
     const struct sbrec_multicast_group *mc;
     SBREC_MULTICAST_GROUP_FOR_EACH (mc, ctx->ovnsb_idl) {
-        struct logical_datapath *ldp = ldp_lookup_or_create(mc->datapath);
+        struct logical_datapath *ldp = ldp_lookup_or_create(ctx, mc->datapath);
+
         simap_put(&ldp->ports, mc->name, mc->tunnel_key);
     }
 
     struct logical_datapath *next_ldp;
     HMAP_FOR_EACH_SAFE (ldp, next_ldp, hmap_node, &logical_datapaths) {
         if (simap_is_empty(&ldp->ports)) {
+            const struct sbrec_datapath_binding *datapath =
+                sbrec_datapath_binding_get_for_uuid(ctx->ovnsb_idl, &ldp->uuid);
+            if (datapath) {
+                VLOG_INFO("add remove datapath "UUID_FMT, UUID_ARGS(&ldp->uuid));
+                sbrec_port_binding_remove_clause_datapath(ctx->binding_cond,
+                                                          OVSDB_IDL_F_EQ,
+                                                          datapath);
+                sbrec_logical_flow_remove_clause_logical_datapath(ctx->lflow_cond,
+                                                                  OVSDB_IDL_F_EQ,
+                                                                  datapath);
+                ctx->binding_cond_updated = true;
+                ctx->lflow_cond_updated = true;
+            }
             ldp_free(ldp);
         }
     }

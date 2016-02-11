@@ -259,6 +259,15 @@ main(int argc, char *argv[])
     char *ovnsb_remote = get_ovnsb_remote(ovs_idl_loop.idl);
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
+
+    struct ovsdb_idl_condition binding_cond;
+    ovsdb_idl_condition_init(&binding_cond, &sbrec_table_port_binding);
+    sbrec_port_binding_add_clause_false(&binding_cond);
+    ovsdb_idl_cond_update(ovnsb_idl_loop.idl, &binding_cond);
+    struct ovsdb_idl_condition lflow_cond;
+    ovsdb_idl_condition_init(&lflow_cond, &sbrec_table_logical_flow);
+    sbrec_logical_flow_add_clause_false(&lflow_cond);
+    ovsdb_idl_cond_update(ovnsb_idl_loop.idl, &lflow_cond);
     ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
     /* Initialize connection tracking zones. */
@@ -276,6 +285,10 @@ main(int argc, char *argv[])
             .ovs_idl_txn = ovsdb_idl_loop_run(&ovs_idl_loop),
             .ovnsb_idl = ovnsb_idl_loop.idl,
             .ovnsb_idl_txn = ovsdb_idl_loop_run(&ovnsb_idl_loop),
+            .binding_cond = &binding_cond,
+            .binding_cond_updated = false,
+            .lflow_cond = &lflow_cond,
+            .lflow_cond_updated = false,
         };
 
         /* Contains bare "struct hmap_node"s whose hash values are the tunnel_key
@@ -338,6 +351,12 @@ main(int argc, char *argv[])
         poll_block();
         if (should_service_stop()) {
             exiting = true;
+        }
+        if (ctx.binding_cond_updated) {
+            ovsdb_idl_cond_update(ctx.ovnsb_idl, ctx.binding_cond);
+        }
+        if (ctx.lflow_cond_updated) {
+            ovsdb_idl_cond_update(ctx.ovnsb_idl, ctx.lflow_cond);
         }
     }
 

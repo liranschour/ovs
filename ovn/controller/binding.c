@@ -27,6 +27,8 @@
 
 VLOG_DEFINE_THIS_MODULE(binding);
 
+struct sset g_lports = SSET_INITIALIZER(&g_lports);
+
 void
 binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 {
@@ -146,6 +148,91 @@ update_qos(const struct ovsrec_interface *iface_rec,
     ovsrec_interface_set_ingress_policing_burst(iface_rec, MAX(0, burst));
 }
 
+static void
+update_lports(struct controller_ctx *ctx,
+              struct sset *tmp_lports)
+{
+    const char **lports_array, **tmp_lports_array;
+    int i, j;
+
+    lports_array = sset_sort(&g_lports);
+    tmp_lports_array = sset_sort(tmp_lports);
+    for (i = 0, j = 0; lports_array[i] && tmp_lports_array[j];) {
+        int cmp = strcmp(lports_array[i], tmp_lports_array[j]);
+        if (!cmp) {
+            i++;
+            j++;
+        } else if (cmp < 0) {
+            VLOG_INFO("remove %s", lports_array[i]);
+            sbrec_port_binding_remove_clause_logical_port(ctx->binding_cond,
+                                                       OVSDB_IDL_F_EQ,
+                                                       lports_array[i]);
+            sbrec_port_binding_remove_clause_parent_port(ctx->binding_cond,
+                                                      OVSDB_IDL_F_EQ,
+                                                      lports_array[i]);
+            ctx->binding_cond_updated = true;
+            sset_find_and_delete_assert(&g_lports, lports_array[i]);
+            i++;
+        } else if (cmp > 0) {
+            VLOG_INFO("add %s", tmp_lports_array[j]);
+            sbrec_port_binding_add_clause_logical_port(ctx->binding_cond,
+                                                       OVSDB_IDL_F_EQ,
+                                                       tmp_lports_array[j]);
+            sbrec_port_binding_add_clause_parent_port(ctx->binding_cond,
+                                                      OVSDB_IDL_F_EQ,
+                                                      tmp_lports_array[j]);
+            ctx->binding_cond_updated = true;
+            sset_add(&g_lports, tmp_lports_array[j]);
+            j++;
+        }
+    }
+    for (; lports_array[i]; i++) {
+        VLOG_INFO("remove %s", lports_array[i]);
+        sbrec_port_binding_remove_clause_logical_port(ctx->binding_cond,
+                                                       OVSDB_IDL_F_EQ,
+                                                       lports_array[i]);
+        sbrec_port_binding_remove_clause_parent_port(ctx->binding_cond,
+                                                     OVSDB_IDL_F_EQ,
+                                                     lports_array[i]);
+        ctx->binding_cond_updated = true;
+        sset_find_and_delete_assert(&g_lports, lports_array[i]);
+    }
+    for (; tmp_lports_array[j]; j++) {
+        VLOG_INFO("add %s", tmp_lports_array[j]);
+        sbrec_port_binding_add_clause_logical_port(ctx->binding_cond,
+                                                   OVSDB_IDL_F_EQ,
+                                                   tmp_lports_array[j]);
+        sbrec_port_binding_add_clause_parent_port(ctx->binding_cond,
+                                                  OVSDB_IDL_F_EQ,
+                                                  tmp_lports_array[j]);
+        ctx->binding_cond_updated = true;
+        sset_add(&g_lports, tmp_lports_array[j]);
+    }
+
+    free(lports_array);
+    free(tmp_lports_array);
+
+    return;
+}
+
+struct sset g_peer_lports = SSET_INITIALIZER(&g_peer_lports);
+
+static void
+add_peer_port(struct controller_ctx *ctx, const char *lport)
+{
+    if (!sset_contains(&g_peer_lports, lport)) {
+        sset_add(&g_peer_lports, lport);
+        VLOG_INFO("Add peer %s", lport);
+        sbrec_port_binding_add_clause_logical_port(ctx->binding_cond,
+                                                   OVSDB_IDL_F_EQ,
+                                                   lport);
+        sbrec_port_binding_add_clause_parent_port(ctx->binding_cond,
+                                                  OVSDB_IDL_F_EQ,
+                                                  lport);
+        ctx->binding_cond_updated = true;
+    }
+}
+
 void
 binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
             const char *chassis_id, struct simap *ct_zones,
@@ -177,6 +264,8 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
         sset_add(&all_lports, node->name);
     }
 
+    update_lports(ctx, &all_lports);
+
     ovsdb_idl_txn_add_comment(
         ctx->ovnsb_idl_txn,"ovn-controller: updating port bindings for '%s'",
         chassis_id);
@@ -185,6 +274,10 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
      * chassis and update the binding accordingly.  This includes both
      * directly connected logical ports and children of those ports. */
     SBREC_PORT_BINDING_FOR_EACH(binding_rec, ctx->ovnsb_idl) {
+        const char *peer = smap_get(&binding_rec->options, "peer");
+        if (peer) {
+            add_peer_port(ctx, peer);
+        }
         const struct ovsrec_interface *iface_rec
             = shash_find_and_delete(&lports, binding_rec->logical_port);
         if (iface_rec

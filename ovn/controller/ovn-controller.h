@@ -29,6 +29,10 @@ struct controller_ctx {
 
     struct ovsdb_idl *ovs_idl;
     struct ovsdb_idl_txn *ovs_idl_txn;
+    struct ovsdb_idl_condition *binding_cond;
+    bool binding_cond_updated;
+    struct ovsdb_idl_condition *lflow_cond;
+    bool lflow_cond_updated;
 };
 
 const struct ovsrec_bridge *get_bridge(struct ovsdb_idl *,

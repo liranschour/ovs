@@ -383,6 +383,13 @@ main(int argc, char *argv[])
     char *ovnsb_remote = get_ovnsb_remote(ovs_idl_loop.idl);
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
+
+    /* Start with false condition. */
+    sbrec_port_binding_add_clause_false(ovnsb_idl_loop.idl);
+    sbrec_logical_flow_add_clause_false(ovnsb_idl_loop.idl);
+    sbrec_multicast_group_add_clause_false(ovnsb_idl_loop.idl);
+    sbrec_mac_binding_add_clause_false(ovnsb_idl_loop.idl);
+
     ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
     int probe_interval = 0;
@@ -427,22 +434,21 @@ main(int argc, char *argv[])
 
         const struct ovsrec_bridge *br_int = get_br_int(&ctx);
         const char *chassis_id = get_chassis_id(ctx.ovs_idl);
+        struct lport_index lports;
+        struct mcgroup_index mcgroups;
+        lport_index_init(&ctx, &lports, ctx.ovnsb_idl);
+        mcgroup_index_init(&ctx, &mcgroups, ctx.ovnsb_idl);
 
         if (chassis_id) {
             chassis_run(&ctx, chassis_id);
             encaps_run(&ctx, br_int, chassis_id);
             binding_run(&ctx, br_int, chassis_id, &all_lports,
-                        &local_datapaths);
+                        &local_datapaths, &lports);
         }
 
         if (br_int && chassis_id) {
             patch_run(&ctx, br_int, chassis_id, &local_datapaths,
                       &patched_datapaths);
-
-            struct lport_index lports;
-            struct mcgroup_index mcgroups;
-            lport_index_init(&lports, ctx.ovnsb_idl);
-            mcgroup_index_init(&mcgroups, ctx.ovnsb_idl);
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
@@ -460,9 +466,9 @@ main(int argc, char *argv[])
             }
             ofctrl_put(&flow_table);
             hmap_destroy(&flow_table);
-            mcgroup_index_destroy(&mcgroups);
-            lport_index_destroy(&lports);
         }
+        mcgroup_index_destroy(&mcgroups);
+        lport_index_destroy(&ctx, &lports);
 
         sset_destroy(&all_lports);
 
@@ -494,6 +500,7 @@ main(int argc, char *argv[])
         }
         ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
         ovsdb_idl_loop_commit_and_wait(&ovs_idl_loop);
+
         poll_block();
         if (should_service_stop()) {
             exiting = true;

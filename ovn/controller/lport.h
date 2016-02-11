@@ -21,6 +21,7 @@
 
 struct ovsdb_idl;
 struct sbrec_datapath_binding;
+struct controller_ctx;
 
 /* Logical port and multicast group indexes
  * ========================================
@@ -34,8 +35,10 @@ struct lport_index {
     struct hmap by_key;
 };
 
-void lport_index_init(struct lport_index *, struct ovsdb_idl *);
-void lport_index_destroy(struct lport_index *);
+void lport_index_init(struct controller_ctx *ctx,
+                      struct lport_index *, struct ovsdb_idl *);
+void lport_index_destroy(struct controller_ctx *ctx,
+                         struct lport_index *);
 
 const struct sbrec_port_binding *lport_lookup_by_name(
     const struct lport_index *, const char *name);
@@ -56,7 +59,8 @@ struct mcgroup_index {
     struct hmap by_dp_name;
 };
 
-void mcgroup_index_init(struct mcgroup_index *, struct ovsdb_idl *);
+void mcgroup_index_init(struct controller_ctx *ctx,
+                        struct mcgroup_index *, struct ovsdb_idl *);
 void mcgroup_index_destroy(struct mcgroup_index *);
 
 const struct sbrec_multicast_group *mcgroup_lookup_by_dp_name(

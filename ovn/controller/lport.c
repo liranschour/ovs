@@ -19,6 +19,7 @@
 #include "hash.h"
 #include "openvswitch/vlog.h"
 #include "ovn/lib/ovn-sb-idl.h"
+#include "ovn-controller.h"
 
 VLOG_DEFINE_THIS_MODULE(lport);
 
@@ -29,12 +30,123 @@ struct lport {
     const struct sbrec_port_binding *pb;
 };
 
+/* Logical datapath that has been added to conditions */
+struct logical_datapath {
+    struct hmap_node hmap_node; /* Indexed on 'uuid'. */
+    struct uuid uuid;           /* UUID from Datapath_Binding row. */
+    uint32_t tunnel_key;        /* 'tunnel_key' from Datapath_Binding row. */
+    size_t n_ports;
+};
+
+/* Contains "struct logical_datapath"s. */
+static struct hmap logical_datapaths = HMAP_INITIALIZER(&logical_datapaths);
+
+/* Finds and returns the logical_datapath for 'binding', or NULL if no such
+ * logical_datapath exists. */
+static struct logical_datapath *
+ldp_lookup(const struct sbrec_datapath_binding *binding)
+{
+    struct logical_datapath *ldp;
+    HMAP_FOR_EACH_IN_BUCKET (ldp, hmap_node, uuid_hash(&binding->header_.uuid),
+                             &logical_datapaths) {
+        if (uuid_equals(&ldp->uuid, &binding->header_.uuid)) {
+            return ldp;
+        }
+    }
+    return NULL;
+}
+
+/* Creates a new logical_datapath for the given 'binding'. */
+static struct logical_datapath *
+ldp_create(const struct sbrec_datapath_binding *binding)
+{
+    struct logical_datapath *ldp;
+
+    ldp = xmalloc(sizeof *ldp);
+    hmap_insert(&logical_datapaths, &ldp->hmap_node,
+                uuid_hash(&binding->header_.uuid));
+    ldp->uuid = binding->header_.uuid;
+    ldp->tunnel_key = binding->tunnel_key;
+    ldp->n_ports = 0;
+    return ldp;
+}
+
+static struct logical_datapath *
+ldp_lookup_or_create(struct controller_ctx *ctx,
+                     const struct sbrec_datapath_binding *binding)
+{
+    struct logical_datapath *ldp = ldp_lookup(binding);
+
+    if (!ldp) {
+        ldp = ldp_create(binding);
+        VLOG_INFO("add logical datapath "UUID_FMT, UUID_ARGS(&ldp->uuid));
+        sbrec_port_binding_add_clause_datapath(ctx->binding_cond,
+                                               OVSDB_IDL_F_EQ, binding);
+        sbrec_logical_flow_add_clause_logical_datapath(ctx->lflow_cond,
+                                                       OVSDB_IDL_F_EQ, binding);
+        sbrec_multicast_group_add_clause_datapath(ctx->mgroup_cond,
+                                                  OVSDB_IDL_F_EQ, binding);
+        ctx->binding_cond_updated = true;
+        ctx->lflow_cond_updated = true;
+        ctx->mgroup_cond_updated = true;
+    }
+    ldp->n_ports++;
+    return ldp;
+}
+
+static void
+ldp_free(struct logical_datapath *ldp)
+{
+    hmap_remove(&logical_datapaths, &ldp->hmap_node);
+    free(ldp);
+}
+
+static void
+ldp_clear_n_ports(void)
+{
+    struct logical_datapath *ldp;
+    HMAP_FOR_EACH (ldp, hmap_node, &logical_datapaths) {
+        ldp->n_ports = 0;
+    }
+}
+
+static void
+ldp_remove_unused(struct controller_ctx *ctx)
+{
+    struct logical_datapath *ldp, *next_ldp;;
+
+    HMAP_FOR_EACH_SAFE (ldp, next_ldp, hmap_node, &logical_datapaths) {
+        if (ldp->n_ports == 0) {
+            const struct sbrec_datapath_binding *datapath =
+                sbrec_datapath_binding_get_for_uuid(ctx->ovnsb_idl, &ldp->uuid);
+            if (datapath) {
+                VLOG_INFO("Remove logical datapath "UUID_FMT, UUID_ARGS(&ldp->uuid));
+                sbrec_port_binding_remove_clause_datapath(ctx->binding_cond,
+                                                          OVSDB_IDL_F_EQ,
+                                                          datapath);
+                sbrec_logical_flow_remove_clause_logical_datapath(ctx->lflow_cond,
+                                                                  OVSDB_IDL_F_EQ,
+                                                                  datapath);
+                sbrec_multicast_group_remove_clause_datapath(ctx->mgroup_cond,
+                                                             OVSDB_IDL_F_EQ,
+                                                             datapath);
+                ctx->binding_cond_updated = true;
+                ctx->lflow_cond_updated = true;
+                ctx->mgroup_cond_updated = true;
+            }
+            ldp_free(ldp);
+        }
+    }
+}
+
 void
-lport_index_init(struct lport_index *lports, struct ovsdb_idl *ovnsb_idl)
+lport_index_init(struct controller_ctx *ctx,
+                 struct lport_index *lports, struct ovsdb_idl *ovnsb_idl)
 {
     hmap_init(&lports->by_name);
     hmap_init(&lports->by_key);
 
+    ldp_clear_n_ports();
     const struct sbrec_port_binding *pb;
     SBREC_PORT_BINDING_FOR_EACH (pb, ovnsb_idl) {
         if (lport_lookup_by_name(lports, pb->logical_port)) {
@@ -43,18 +155,19 @@ lport_index_init(struct lport_index *lports, struct ovsdb_idl *ovnsb_idl)
                          pb->logical_port);
             continue;
         }
-
         struct lport *p = xmalloc(sizeof *p);
         hmap_insert(&lports->by_name, &p->name_node,
                     hash_string(pb->logical_port, 0));
         hmap_insert(&lports->by_key, &p->key_node,
                     hash_int(pb->tunnel_key, pb->datapath->tunnel_key));
         p->pb = pb;
+        ldp_lookup_or_create(ctx, pb->datapath);
     }
 }
 
 void
-lport_index_destroy(struct lport_index *lports)
+lport_index_destroy(struct controller_ctx *ctx,
+                    struct lport_index *lports)
 {
     /* Destroy all of the "struct lport"s.
      *
@@ -66,6 +179,7 @@ lport_index_destroy(struct lport_index *lports)
 
     hmap_destroy(&lports->by_name);
     hmap_destroy(&lports->by_key);
+    ldp_remove_unused(ctx);
 }
 
 /* Finds and returns the lport with the given 'name', or NULL if no such lport
@@ -104,7 +218,8 @@ struct mcgroup {
 };
 
 void
-mcgroup_index_init(struct mcgroup_index *mcgroups, struct ovsdb_idl *ovnsb_idl)
+mcgroup_index_init(struct controller_ctx *ctx,
+                   struct mcgroup_index *mcgroups, struct ovsdb_idl *ovnsb_idl)
 {
     hmap_init(&mcgroups->by_dp_name);
 
@@ -122,6 +237,7 @@ mcgroup_index_init(struct mcgroup_index *mcgroups, struct ovsdb_idl *ovnsb_idl)
         hmap_insert(&mcgroups->by_dp_name, &m->dp_name_node,
                     hash_string(mg->name, uuid_hash(dp_uuid)));
         m->mg = mg;
+        ldp_lookup_or_create(ctx, mg->datapath);
     }
 }
 

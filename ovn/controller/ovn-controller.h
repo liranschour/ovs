@@ -29,6 +29,12 @@ struct controller_ctx {
 
     struct ovsdb_idl *ovs_idl;
     struct ovsdb_idl_txn *ovs_idl_txn;
+    struct ovsdb_idl_condition *binding_cond;
+    bool binding_cond_updated;
+    struct ovsdb_idl_condition *lflow_cond;
+    bool lflow_cond_updated;
+    struct ovsdb_idl_condition *mgroup_cond;
+    bool mgroup_cond_updated;
 };
 
 /* Contains hmap_node whose hash values are the tunnel_key of datapaths

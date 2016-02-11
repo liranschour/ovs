@@ -259,6 +259,23 @@ main(int argc, char *argv[])
     char *ovnsb_remote = get_ovnsb_remote(ovs_idl_loop.idl);
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
+
+    struct ovsdb_idl_condition binding_cond;
+    ovsdb_idl_condition_init(&binding_cond, &sbrec_table_port_binding);
+    sbrec_port_binding_add_clause_false(&binding_cond);
+    ovsdb_idl_cond_update(ovnsb_idl_loop.idl, &binding_cond);
+    struct ovsdb_idl_condition lflow_cond;
+    ovsdb_idl_condition_init(&lflow_cond, &sbrec_table_logical_flow);
+    sbrec_logical_flow_add_clause_false(&lflow_cond);
+    ovsdb_idl_cond_update(ovnsb_idl_loop.idl, &lflow_cond);
+    struct ovsdb_idl_condition mgroup_cond;
+    ovsdb_idl_condition_init(&mgroup_cond, &sbrec_table_multicast_group);
+    sbrec_multicast_group_add_clause_false(&mgroup_cond);
+    ovsdb_idl_cond_update(ovnsb_idl_loop.idl, &mgroup_cond);
+    struct ovsdb_idl_condition mac_binding_cond;
+    ovsdb_idl_condition_init(&mac_binding_cond, &sbrec_table_mac_binding);
+    sbrec_mac_binding_add_clause_false(&mac_binding_cond);
+    ovsdb_idl_cond_update(ovnsb_idl_loop.idl, &mac_binding_cond);
     ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
     /* Initialize connection tracking zones. */
@@ -276,6 +293,14 @@ main(int argc, char *argv[])
             .ovs_idl_txn = ovsdb_idl_loop_run(&ovs_idl_loop),
             .ovnsb_idl = ovnsb_idl_loop.idl,
             .ovnsb_idl_txn = ovsdb_idl_loop_run(&ovnsb_idl_loop),
+            .binding_cond = &binding_cond,
+            .binding_cond_updated = false,
+            .lflow_cond = &lflow_cond,
+            .lflow_cond_updated = false,
+            .mgroup_cond = &mgroup_cond,
+            .mgroup_cond_updated = false,
+            .mac_binding_cond = &mac_binding_cond,
+            .mac_binding_cond_updated = false,
         };
 
         /* Contains "struct local_datpath" nodes whose hash values are the
@@ -284,21 +309,20 @@ main(int argc, char *argv[])
 
         const struct ovsrec_bridge *br_int = get_br_int(&ctx);
         const char *chassis_id = get_chassis_id(ctx.ovs_idl);
+        struct lport_index lports;
+        struct mcgroup_index mcgroups;
+        lport_index_init(&ctx, &lports, ctx.ovnsb_idl);
+        mcgroup_index_init(&ctx, &mcgroups, ctx.ovnsb_idl);
 
         if (chassis_id) {
             chassis_run(&ctx, chassis_id);
             encaps_run(&ctx, br_int, chassis_id);
             binding_run(&ctx, br_int, chassis_id, &ct_zones, ct_zone_bitmap,
-                    &local_datapaths);
+                        &local_datapaths, &lports);
         }
 
         if (br_int) {
             patch_run(&ctx, br_int, &local_datapaths);
-
-            struct lport_index lports;
-            struct mcgroup_index mcgroups;
-            lport_index_init(&lports, ctx.ovnsb_idl);
-            mcgroup_index_init(&mcgroups, ctx.ovnsb_idl);
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
@@ -314,9 +338,9 @@ main(int argc, char *argv[])
             }
             ofctrl_put(&flow_table);
             hmap_destroy(&flow_table);
-            mcgroup_index_destroy(&mcgroups);
-            lport_index_destroy(&lports);
         }
+        mcgroup_index_destroy(&mcgroups);
+        lport_index_destroy(&ctx, &lports);
 
         struct local_datapath *cur_node, *next_node;
         HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &local_datapaths) {
@@ -338,6 +362,20 @@ main(int argc, char *argv[])
         }
         ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
         ovsdb_idl_loop_commit_and_wait(&ovs_idl_loop);
+
+        if (ctx.binding_cond_updated) {
+            ovsdb_idl_cond_update(ctx.ovnsb_idl, ctx.binding_cond);
+        }
+        if (ctx.lflow_cond_updated) {
+            ovsdb_idl_cond_update(ctx.ovnsb_idl, ctx.lflow_cond);
+        }
+        if (ctx.mgroup_cond_updated) {
+            ovsdb_idl_cond_update(ctx.ovnsb_idl, ctx.mgroup_cond);
+        }
+        if (ctx.mac_binding_cond_updated) {
+            ovsdb_idl_cond_update(ctx.ovnsb_idl, ctx.mac_binding_cond);
+        }
+
         poll_block();
         if (should_service_stop()) {
             exiting = true;

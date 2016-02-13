@@ -38,6 +38,7 @@
 #include "monitor.h"
 #include "openvswitch/vlog.h"
 
+VLOG_DEFINE_THIS_MODULE(ovsdb_monitor);
 
 static const struct ovsdb_replica_class ovsdb_jsonrpc_replica_class;
 static struct hmap ovsdb_monitors = HMAP_INITIALIZER(&ovsdb_monitors);
@@ -50,10 +51,16 @@ struct ovsdb_monitor_session_condition {
                               *   "struct ovsdb_monitor_table_condition *"s. */
 };
 
+enum monitor_table_condition_mode {
+    MTC_MODE_TRUE,    /* monitor all rows in table */
+    MTC_MODE_FULL,    /* full conditional monitoring */
+};
+
 /* Monitored table session's conditions */
 struct ovsdb_monitor_table_condition {
     const struct ovsdb_table *table;
     struct ovsdb_monitor_table *mt;
+    enum monitor_table_condition_mode cond_mode;
     struct ovsdb_condition old_condition;
     struct ovsdb_condition new_condition;
 };
@@ -142,6 +149,8 @@ struct ovsdb_monitor_table {
      * ovsdb_monitor_row. It is used for condition evaluation */
     unsigned int *columns_index_map;
 
+    /* Contains "ovsdb_monitor_json_cache_node"s.*/
+    struct hmap json_cache;
     /* Contains 'ovsdb_monitor_changes' indexed by 'transaction'. */
     struct hmap changes;
 };
@@ -175,14 +184,14 @@ json_cache_hash(enum ovsdb_monitor_version version, uint64_t from_txn)
 }
 
 static struct ovsdb_monitor_json_cache_node *
-ovsdb_monitor_json_cache_search(const struct ovsdb_monitor *dbmon,
+ovsdb_monitor_json_cache_search(const struct hmap *json_cache,
                                 enum ovsdb_monitor_version version,
                                 uint64_t from_txn)
 {
     struct ovsdb_monitor_json_cache_node *node;
     uint32_t hash = json_cache_hash(version, from_txn);
 
-    HMAP_FOR_EACH_WITH_HASH(node, hmap_node, hash, &dbmon->json_cache) {
+    HMAP_FOR_EACH_WITH_HASH(node, hmap_node, hash, json_cache) {
         if (node->from_txn == from_txn && node->version == version) {
             return node;
         }
@@ -192,7 +201,7 @@ ovsdb_monitor_json_cache_search(const struct ovsdb_monitor *dbmon,
 }
 
 static void
-ovsdb_monitor_json_cache_insert(struct ovsdb_monitor *dbmon,
+ovsdb_monitor_json_cache_insert(struct hmap *json_cache,
                                 enum ovsdb_monitor_version version,
                                 uint64_t from_txn, struct json *json)
 {
@@ -205,16 +214,16 @@ ovsdb_monitor_json_cache_insert(struct ovsdb_monitor *dbmon,
     node->from_txn = from_txn;
     node->json = json ? json_clone(json) : NULL;
 
-    hmap_insert(&dbmon->json_cache, &node->hmap_node, hash);
+    hmap_insert(json_cache, &node->hmap_node, hash);
 }
 
 static void
-ovsdb_monitor_json_cache_flush(struct ovsdb_monitor *dbmon)
+ovsdb_monitor_json_cache_flush(struct hmap *json_cache)
 {
     struct ovsdb_monitor_json_cache_node *node, *next;
 
-    HMAP_FOR_EACH_SAFE(node, next, hmap_node, &dbmon->json_cache) {
-        hmap_remove(&dbmon->json_cache, &node->hmap_node);
+    HMAP_FOR_EACH_SAFE(node, next, hmap_node, json_cache) {
+        hmap_remove(json_cache, &node->hmap_node);
         json_destroy(node->json);
         free(node);
     }
@@ -395,6 +404,7 @@ ovsdb_monitor_add_table(struct ovsdb_monitor *m,
     mt->dbmon = m;
     shash_add(&m->tables, table->schema->name, mt);
     hmap_init(&mt->changes);
+    hmap_init(&mt->json_cache);
     mt->columns_index_map =
         xmalloc(sizeof(unsigned int) * shash_count(&table->schema->columns));
     for (i = 0; i < shash_count(&table->schema->columns); i++) {
@@ -655,6 +665,8 @@ ovsdb_monitor_table_condition_set(
     if (ovsdb_condition_is_true(&mtc->old_condition)) {
         condition->n_true_cnd++;
         ovsdb_monitor_session_condition_set_mode(condition);
+    } else {
+        mtc->cond_mode = MTC_MODE_FULL;
     }
 
     return NULL;
@@ -924,46 +936,71 @@ ovsdb_monitor_compose_update(
                       struct ovsdb_monitor *dbmon,
                       bool initial, uint64_t transaction,
                       const struct ovsdb_monitor_session_condition *condition,
-                      compose_row_update_cb_func row_update)
+                      enum ovsdb_monitor_version version)
 {
     struct shash_node *node;
     struct json *json;
     size_t max_columns = ovsdb_monitor_max_columns(dbmon);
     unsigned long int *changed = xmalloc(bitmap_n_bytes(max_columns));
+    compose_row_update_cb_func row_update = version == OVSDB_MONITOR_V1 ?
+        ovsdb_monitor_compose_row_update : ovsdb_monitor_compose_row_update2;
 
     json = NULL;
     SHASH_FOR_EACH (node, &dbmon->tables) {
         struct ovsdb_monitor_table *mt = node->data;
+        struct ovsdb_monitor_table_condition *mtc = condition ?
+            shash_find_data(&condition->tables, node->name) : NULL;
+        struct ovsdb_monitor_json_cache_node *cache_node = NULL;
         struct ovsdb_monitor_row *row, *next;
         struct ovsdb_monitor_changes *changes;
         struct json *table_json = NULL;
 
-        changes = ovsdb_monitor_table_find_changes(mt, transaction);
-        if (!changes) {
-            continue;
+        if (!mtc || !mtc->cond_mode) {
+            cache_node = ovsdb_monitor_json_cache_search(&mt->json_cache,
+                                                         version, transaction);
         }
-
-        HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
-            struct json *row_json;
-
-            row_json = (*row_update)(mt, condition, row, initial, changed);
-            if (row_json) {
-                char uuid[UUID_LEN + 1];
-
-                /* Create JSON object for transaction overall. */
+        if (cache_node) {
+            table_json = cache_node->json ?
+                json_clone(cache_node->json) : NULL;
+            if (table_json) {
                 if (!json) {
                     json = json_object_create();
                 }
+                json_object_put(json, mt->table->schema->name, table_json);
+            }
+        } else {
+            changes = ovsdb_monitor_table_find_changes(mt, transaction);
+            if (!changes) {
+                continue;
+            }
 
-                /* Create JSON object for transaction on this table. */
-                if (!table_json) {
-                    table_json = json_object_create();
-                    json_object_put(json, mt->table->schema->name, table_json);
+            HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
+                struct json *row_json;
+
+                row_json = (*row_update)(mt, condition, row, initial, changed);
+                if (row_json) {
+                    char uuid[UUID_LEN + 1];
+
+                    /* Create JSON object for transaction overall. */
+                    if (!json) {
+                        json = json_object_create();
+                    }
+                    /* Create JSON object for transaction on this table. */
+                    if (!table_json) {
+                        table_json = json_object_create();
+                        json_object_put(json, mt->table->schema->name,
+                                        table_json);
+                    }
+
+                    /* Add JSON row to JSON table. */
+                    snprintf(uuid, sizeof uuid,
+                             UUID_FMT,UUID_ARGS(&row->uuid));
+                    json_object_put(table_json, uuid, row_json);
                 }
-
-                /* Add JSON row to JSON table. */
-                snprintf(uuid, sizeof uuid, UUID_FMT, UUID_ARGS(&row->uuid));
-                json_object_put(table_json, uuid, row_json);
+            }
+            if (!mtc || !mtc->cond_mode) {
+                ovsdb_monitor_json_cache_insert(&mt->json_cache, version,
+                                                transaction, table_json);
             }
         }
     }
@@ -995,26 +1032,19 @@ ovsdb_monitor_get_update(
     /* Return a clone of cached json if one exists. Otherwise,
      * generate a new one and add it to the cache.  */
     if (!condition || !condition->conditional) {
-        cache_node = ovsdb_monitor_json_cache_search(dbmon, version,
-                                                     unflushed);
+        cache_node = ovsdb_monitor_json_cache_search(&dbmon->json_cache,
+                                                     version, unflushed);
     }
     if (cache_node) {
         json = cache_node->json ? json_clone(cache_node->json) : NULL;
     } else {
-        if (version == OVSDB_MONITOR_V1) {
-            json =
-               ovsdb_monitor_compose_update(dbmon, initial, unflushed,
+        json = ovsdb_monitor_compose_update(dbmon, initial, unflushed,
                                             condition,
-                                            ovsdb_monitor_compose_row_update);
-        } else {
-            ovs_assert(version == OVSDB_MONITOR_V2);
-            json =
-               ovsdb_monitor_compose_update(dbmon, initial, unflushed,
-                                            condition,
-                                            ovsdb_monitor_compose_row_update2);
-        }
+                                            version);
+
         if (!condition || !condition->conditional) {
-            ovsdb_monitor_json_cache_insert(dbmon, version, unflushed, json);
+            ovsdb_monitor_json_cache_insert(&dbmon->json_cache, version,
+                                            unflushed, json);
         }
     }
 
@@ -1185,19 +1215,21 @@ ovsdb_monitor_change_cb(const struct ovsdb_row *old,
     }
     mt = aux->mt;
 
-    HMAP_FOR_EACH(changes, hmap_node, &mt->changes) {
-        enum ovsdb_monitor_changes_efficacy efficacy;
-        enum ovsdb_monitor_selection type;
+    enum ovsdb_monitor_selection type =
+        ovsdb_monitor_row_update_type(false, old, new);
+    enum ovsdb_monitor_changes_efficacy efficacy =
+        ovsdb_monitor_changes_classify(type, mt, changed);
 
-        type = ovsdb_monitor_row_update_type(false, old, new);
-        efficacy = ovsdb_monitor_changes_classify(type, mt, changed);
+    if (efficacy == OVSDB_CHANGES_REQUIRE_EXTERNAL_UPDATE) {
+        ovsdb_monitor_json_cache_flush(&mt->json_cache);
+    }
+    HMAP_FOR_EACH(changes, hmap_node, &mt->changes) {
         if (efficacy > OVSDB_CHANGES_NO_EFFECT) {
             ovsdb_monitor_changes_update(old, new, mt, changes);
         }
-
-        if (aux->efficacy < efficacy) {
-            aux->efficacy = efficacy;
-        }
+    }
+    if (aux->efficacy < efficacy) {
+        aux->efficacy = efficacy;
     }
 
     return true;
@@ -1375,7 +1407,7 @@ ovsdb_monitor_destroy(struct ovsdb_monitor *dbmon)
         hmap_remove(&ovsdb_monitors, &dbmon->hmap_node);
     }
 
-    ovsdb_monitor_json_cache_flush(dbmon);
+    ovsdb_monitor_json_cache_flush(&dbmon->json_cache);
     hmap_destroy(&dbmon->json_cache);
 
     SHASH_FOR_EACH (node, &dbmon->tables) {
@@ -1420,7 +1452,7 @@ ovsdb_monitor_commit(struct ovsdb_replica *replica,
         /* Nothing.  */
         break;
     case  OVSDB_CHANGES_REQUIRE_EXTERNAL_UPDATE:
-        ovsdb_monitor_json_cache_flush(m);
+        ovsdb_monitor_json_cache_flush(&m->json_cache);
         break;
     }
 

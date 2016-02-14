@@ -53,6 +53,7 @@ struct ovsdb_monitor_session_condition {
 
 enum monitor_table_condition_mode {
     MTC_MODE_TRUE,    /* monitor all rows in table */
+    MTC_MODE_FALSE,   /* nothing to monitor */
     MTC_MODE_FULL,    /* full conditional monitoring */
 };
 
@@ -694,6 +695,8 @@ ovsdb_monitor_table_condition_set(
     if (ovsdb_condition_is_true(&mtc->old_condition)) {
         condition->n_true_cnd++;
         ovsdb_monitor_session_condition_set_mode(condition);
+    } else if (ovsdb_condition_is_false(&mtc->old_condition)) {
+        mtc->cond_mode = MTC_MODE_FALSE;
     } else {
         mtc->cond_mode = MTC_MODE_FULL;
     }
@@ -763,17 +766,24 @@ ovsdb_monitor_table_condition_updated(struct ovsdb_monitor_table *mt,
         shash_find_data(&condition->tables, mt->table->schema->name);
 
     if (mtc) {
+        bool old_true = ovsdb_condition_is_true(&mtc->old_condition);
+
         /* If conditional monitoring - set old condition to new condition */
         if (ovsdb_condition_cmp_3way(&mtc->old_condition,
                                      &mtc->new_condition)) {
             if (ovsdb_condition_is_true(&mtc->new_condition)) {
                 mtc->cond_mode = MTC_MODE_TRUE;
-                if (!ovsdb_condition_is_true(&mtc->old_condition)) {
+                if (!old_true) {
                     condition->n_true_cnd++;
+                }
+            } else if (ovsdb_condition_is_false(&mtc->new_condition)) {
+                mtc->cond_mode = MTC_MODE_FALSE;
+                if (old_true) {
+                    condition->n_true_cnd--;
                 }
             } else {
                 mtc->cond_mode = MTC_MODE_FULL;
-                if (ovsdb_condition_is_true(&mtc->old_condition)) {
+                if (old_true) {
                     condition->n_true_cnd--;
                 }
             }
@@ -1088,6 +1098,9 @@ ovsdb_monitor_compose_update(
         struct ovsdb_monitor_changes *changes;
         struct json *table_json = NULL;
 
+        if (mtc && mtc->cond_mode == MTC_MODE_FALSE) {
+            continue;
+        }
         if (!mtc || !mtc->cond_mode) {
             cache_node = ovsdb_monitor_json_cache_search(&mt->json_cache,
                                                          version, transaction);

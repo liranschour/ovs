@@ -1318,6 +1318,47 @@ ovsdb_monitor_add_json_row(struct json **json, const char *table_name,
     json_object_put(*table_json, uuid, row_json);
 }
 
+/* Save processed rows to avoid duplications if row matchs
+ * more the one clause */
+struct row_uuid {
+    struct hmap_node hmap_node;
+    struct uuid uuid;
+};
+
+static bool
+uuid_exists(struct hmap *row_uuids, struct uuid *uuid)
+{
+    struct row_uuid *row_uuid;
+
+    HMAP_FOR_EACH_WITH_HASH (row_uuid, hmap_node, uuid_hash(uuid),
+                             row_uuids) {
+        if (uuid_equals(&row_uuid->uuid, uuid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+uuid_insert(struct hmap *row_uuids, struct uuid *uuid)
+{
+    struct row_uuid *row_uuid = xzalloc(sizeof *row_uuid);
+
+    row_uuid->uuid = *uuid;
+    hmap_insert(row_uuids, &row_uuid->hmap_node, uuid_hash(uuid));
+
+}
+
+static void row_uuids_destroy(struct hmap *row_uuids)
+{
+    struct row_uuid *row_uuid, *next;
+
+    HMAP_FOR_EACH_SAFE(row_uuid, next, hmap_node, row_uuids) {
+        hmap_remove(row_uuids, &row_uuid->hmap_node);
+        free(row_uuid);
+    }
+}
+
 /* Constructs and returns JSON for a <table-updates> object (as described in
  * RFC 7047) for all the outstanding changes within 'monitor', starting from
  * 'transaction'.  */
@@ -1348,7 +1389,7 @@ ovsdb_monitor_compose_update(
         if (mtc && mtc->cond_mode == MTC_MODE_FALSE) {
             continue;
         }
-        if (!mtc || !mtc->cond_mode) {
+        if (!mtc || mtc->cond_mode == MTC_MODE_TRUE) {
             cache_node = ovsdb_monitor_json_cache_search(&mt->json_cache,
                                                          version, transaction);
         }
@@ -1362,24 +1403,67 @@ ovsdb_monitor_compose_update(
                 json_object_put(json, mt->table->schema->name, table_json);
             }
         } else {
-            changes = ovsdb_monitor_table_find_changes(mt, transaction);
-            if (!changes) {
-                continue;
-            }
+            if (!initial && mtc && mtc->cond_mode == MTC_MODE_EQ_COND) {
+                int i;
+                struct hmap row_uuids = HMAP_INITIALIZER(&row_uuids);
 
-            HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
-                struct json *row_json;
-                row_json = (*row_update)(mt, condition, OVSDB_MONITOR_ROW, row,
-                                         initial, changed);
-                if (row_json) {
-                    ovsdb_monitor_add_json_row(&json, mt->table->schema->name,
-                                               &table_json, row_json,
-                                               &row->uuid);
+                /* iterate over session clauses */
+                for (i = 0; i < mtc->old_condition.n_clauses; i++) {
+                    struct ovsdb_clause *clause =
+                        &mtc->old_condition.clauses[i];
+
+                    changes =
+                        ovsdb_monitor_table_find_clause_changes(mtc, clause);
+                    if (!changes) {
+                        continue;
+                    }
+
+                    HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
+                        struct json *row_json;
+
+                        ovsdb_monitor_row_set_old(row, transaction);
+                        if (row->transaction < transaction) {
+                            continue;
+                        }
+                        if (uuid_exists(&row_uuids, &row->uuid)) {
+                            continue;
+                        }
+                        uuid_insert(&row_uuids, &row->uuid);
+
+                        row_json = (*row_update)(mt, condition,
+                                                 OVSDB_MONITOR_ROW, row,
+                                                 initial, changed);
+                        if (row_json) {
+                            ovsdb_monitor_add_json_row(&json,
+                                                       mt->table->schema->name,
+                                                       &table_json, row_json,
+                                                       &row->uuid);
+                        }
+                    }
                 }
-            }
-            if (!mtc || !mtc->cond_mode) {
-                ovsdb_monitor_json_cache_insert(&mt->json_cache, version,
-                                                transaction, table_json);
+                row_uuids_destroy(&row_uuids);
+            } else {
+                changes = ovsdb_monitor_table_find_changes(mt, transaction);
+
+                if (!changes) {
+                    continue;
+                }
+
+                HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
+                    struct json *row_json;
+                    row_json = (*row_update)(mt, condition, OVSDB_MONITOR_ROW,
+                                             row, initial, changed);
+                    if (row_json) {
+                        ovsdb_monitor_add_json_row(&json,
+                                                   mt->table->schema->name,
+                                                   &table_json, row_json,
+                                                   &row->uuid);
+                    }
+                }
+                if (!mtc || !mtc->cond_mode) {
+                    ovsdb_monitor_json_cache_insert(&mt->json_cache, version,
+                                                    transaction, table_json);
+                }
             }
         }
     }
@@ -1688,9 +1772,12 @@ ovsdb_monitor_change_cb(const struct ovsdb_row *old,
     if (efficacy == OVSDB_CHANGES_REQUIRE_EXTERNAL_UPDATE) {
         ovsdb_monitor_json_cache_flush(&mt->json_cache);
     }
-    HMAP_FOR_EACH(changes, hmap_node, &mt->changes) {
-        if (efficacy > OVSDB_CHANGES_NO_EFFECT) {
+    if (efficacy > OVSDB_CHANGES_NO_EFFECT) {
+        HMAP_FOR_EACH(changes, hmap_node, &mt->changes) {
             ovsdb_monitor_changes_update(old, new, mt, changes, 0);
+        }
+        if (mt->clauses_tracking) {
+            ovsdb_monitor_clauses_changes_update(old, new, mt);
         }
     }
 

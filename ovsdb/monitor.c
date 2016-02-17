@@ -54,6 +54,7 @@ struct ovsdb_monitor_session_condition {
 enum monitor_table_condition_mode {
     MTC_MODE_TRUE,    /* monitor all rows in table */
     MTC_MODE_FALSE,   /* nothing to monitor */
+    MTC_MODE_EQ_COND, /* only "==" conditional monitoring */
     MTC_MODE_FULL,    /* full conditional monitoring */
 };
 
@@ -171,7 +172,7 @@ struct ovsdb_monitor_table {
     struct hmap json_cache;
     /* Contains 'ovsdb_monitor_changes' indexed by 'transaction'. */
     struct hmap changes;
-    bool track_columns;
+    bool track_clauses;
     /* Contains ovsdb_tracked_clauses * */
     struct shash trk_clauses;
 };
@@ -628,8 +629,16 @@ ovsdb_monitor_condition_bind(struct ovsdb_monitor *dbmon,
         struct ovsdb_monitor_table *mt =
             shash_find_data(&dbmon->tables, mtc->table->schema->name);
 
+        ovs_assert(mtc);
         mtc->mt = mt;
         ovsdb_monitor_condition_add_columns(dbmon, mtc->table, &mtc->new_condition);
+        if (mtc->cond_mode == MTC_MODE_EQ_COND) {
+            /* Track columns on this table */
+            mt->track_clauses = true;
+            ovsdb_monitor_condition_update_tracking(mtc->mt,
+                                                    &mtc->old_condition,
+                                                    NULL);
+        }
     }
 }
 
@@ -899,11 +908,19 @@ ovsdb_monitor_table_condition_set(
     shash_add(&condition->tables, table->schema->name, mtc);
     /* On session startup old == new condition */
     ovsdb_condition_clone(&mtc->new_condition, &mtc->old_condition);
+
+    enum ovsdb_function max_function =
+        ovsdb_condition_max_function(&mtc->old_condition);
+
     if (ovsdb_condition_is_true(&mtc->old_condition)) {
         condition->n_true_cnd++;
         ovsdb_monitor_session_condition_set_mode(condition);
     } else if (ovsdb_condition_is_false(&mtc->old_condition)) {
         mtc->cond_mode = MTC_MODE_FALSE;
+    } else if (max_function <= OVSDB_F_INCLUDES) {
+        mtc->cond_mode = MTC_MODE_EQ_COND;
+        /* We will update tracking of condition's columns only on condition
+         * bind. (After ovsdb_monitor_add) */
     } else {
         mtc->cond_mode = MTC_MODE_FULL;
     }
@@ -977,6 +994,9 @@ ovsdb_monitor_table_condition_updated(struct ovsdb_monitor_table *mt,
 
         /* If conditional monitoring - set old condition to new condition */
         if (ovsdb_condition_cmp(&mtc->old_condition, &mtc->new_condition)) {
+            enum ovsdb_function max_function =
+                ovsdb_condition_max_function(&mtc->old_condition);
+
             if (ovsdb_condition_is_true(&mtc->new_condition)) {
                 mtc->cond_mode = MTC_MODE_TRUE;
                 if (!old_true) {
@@ -984,6 +1004,16 @@ ovsdb_monitor_table_condition_updated(struct ovsdb_monitor_table *mt,
                 }
             } else if (ovsdb_condition_is_false(&mtc->new_condition)) {
                 mtc->cond_mode = MTC_MODE_FALSE;
+                if (old_true) {
+                    condition->n_true_cnd--;
+                }
+            } else if (max_function <= OVSDB_F_INCLUDES) {
+                mtc->cond_mode = MTC_MODE_EQ_COND;
+                /* Track columns on this table */
+                mt->track_clauses = true;
+                ovsdb_monitor_condition_update_tracking(mtc->mt,
+                                                        &mtc->old_condition,
+                                                        &mtc->new_condition);
                 if (old_true) {
                     condition->n_true_cnd--;
                 }

@@ -103,6 +103,13 @@ struct ovsdb_monitor_column {
     bool monitored;
 };
 
+/* Conditional tracked clauses */
+struct ovsdb_tracked_clauses {
+    const struct ovsdb_column *column;
+    /* Contains 'ovsdb_monitor_changes' indexed by datum hash. */
+    struct hmap changes;
+};
+
 /* An old value of a row at transaction point in time */
 struct ovsdb_monitor_data {
     struct ovs_list node;
@@ -182,6 +189,9 @@ struct ovsdb_monitor_table {
     struct hmap json_cache;
     /* Contains 'ovsdb_monitor_changes' indexed by 'transaction'. */
     struct hmap changes;
+    bool clauses_tracking;
+    /* Contains ovsdb_tracked_clauses * */
+    struct shash trk_clauses;
 };
 
 enum ovsdb_monitor_row_type {
@@ -457,6 +467,7 @@ ovsdb_monitor_add_table(struct ovsdb_monitor *m,
     shash_add(&m->tables, table->schema->name, mt);
     hmap_init(&mt->changes);
     hmap_init(&mt->json_cache);
+    shash_init(&mt->trk_clauses);
     mt->columns_index_map =
         xmalloc(sizeof(unsigned int) * shash_count(&table->schema->columns));
     for (i = 0; i < shash_count(&table->schema->columns); i++) {
@@ -531,6 +542,99 @@ ovsdb_monitor_condition_add_columns(struct ovsdb_monitor *dbmon,
     }
     if (n_columns) {
         free(columns);
+    }
+}
+
+/* Clause function must be OVSDB_F_EQ or OVSDB_F_INCLUDES */
+static void
+ovsdb_monitor_add_tracked_clause(struct ovsdb_monitor_table *mt,
+                                 struct ovsdb_clause *c)
+{
+    struct ovsdb_monitor_changes *changes;
+    size_t hash = ovsdb_datum_hash(&c->arg, &c->column->type, 0);
+    struct ovsdb_tracked_clauses *column = shash_find_data(&mt->trk_clauses,
+                                                           c->column->name);
+
+    if (!column) {
+        column = xmalloc(sizeof *column);
+        column->column = c->column;
+        hmap_init(&column->changes);
+        shash_add(&mt->trk_clauses, c->column->name, column);
+    }
+
+    HMAP_FOR_EACH_WITH_HASH(changes, hmap_node, hash, &column->changes) {
+        if (ovsdb_datum_equals(&c->arg, &changes->arg, &c->column->type)) {
+            changes->n_refs++;
+            return;
+        }
+    }
+
+    changes = xzalloc(sizeof *changes);
+    changes->mt = mt;
+    changes->n_refs = 1;
+    ovsdb_datum_clone(&changes->arg, &c->arg, &c->column->type);
+    changes->type = &c->column->type;
+    hmap_init(&changes->rows);
+    hmap_insert(&column->changes, &changes->hmap_node, hash);
+}
+
+static void
+ovsdb_monitor_remove_tracked_clause(struct ovsdb_monitor_table *mt,
+                                    struct ovsdb_clause *c)
+{
+    struct ovsdb_monitor_changes *changes;
+    size_t hash = ovsdb_datum_hash(&c->arg, &c->column->type, 0);
+    struct ovsdb_tracked_clauses *column = shash_find_data(&mt->trk_clauses,
+                                                           c->column->name);
+
+    ovs_assert(column);
+
+    HMAP_FOR_EACH_WITH_HASH(changes, hmap_node, hash, &column->changes) {
+        if (ovsdb_datum_equals(&c->arg, &changes->arg, &c->column->type)) {
+            if (--changes->n_refs == 0) {
+                hmap_remove(&column->changes, &changes->hmap_node);
+                ovsdb_monitor_changes_destroy(changes);
+                if (hmap_is_empty(&column->changes)) {
+                    shash_delete(&mt->trk_clauses,
+                                 shash_find(&mt->trk_clauses,
+                                            c->column->name));
+                    free(column);
+                }
+            }
+            return;
+        }
+    }
+
+    OVS_NOT_REACHED();
+}
+
+static void
+ovsdb_monitor_condition_update_tracking(struct ovsdb_monitor_table *mt,
+                                        struct ovsdb_condition *old,
+                                        struct ovsdb_condition *new)
+{
+    struct ovsdb_condition *added, a = OVSDB_CONDITION_INITIALIZER;
+    struct ovsdb_condition *removed, b = OVSDB_CONDITION_INITIALIZER;
+    int i;
+
+    if (!new) {
+        added = old;
+        removed = NULL;
+    } else {
+        added = &a;
+        removed = &b;
+        ovsdb_condition_diff(old, new, added, removed);
+    }
+
+    for (i = 0; i < added->n_clauses; i++) {
+        if (added->clauses[i].function > OVSDB_F_TRUE) {
+            ovsdb_monitor_add_tracked_clause(mt, &added->clauses[i]);
+        }
+    }
+    for (i = 0; removed && i < removed->n_clauses; i++) {
+        if (removed->clauses[i].function > OVSDB_F_TRUE) {
+            ovsdb_monitor_remove_tracked_clause(mt, &removed->clauses[i]);
+        }
     }
 }
 
@@ -646,6 +750,80 @@ ovsdb_monitor_table_track_changes(struct ovsdb_monitor_table *mt,
         changes->n_refs++;
     } else {
         ovsdb_monitor_table_add_changes(mt, transaction);
+    }
+}
+
+static struct ovsdb_monitor_changes *
+ovsdb_monitor_table_find_clause_changes(
+                                     struct ovsdb_monitor_table_condition *mtc,
+                                     struct ovsdb_clause *clause)
+{
+    struct ovsdb_monitor_table *mt = mtc->mt;
+    size_t hash = ovsdb_datum_hash(&clause->arg, &clause->column->type, 0);
+    struct ovsdb_tracked_clauses *column;
+
+    if (clause->function == OVSDB_F_FALSE) {
+        return NULL;
+    }
+    ovs_assert(clause->function == OVSDB_F_EQ ||
+               clause->function == OVSDB_F_INCLUDES);
+
+    column = shash_find_data(&mt->trk_clauses, clause->column->name);
+    ovs_assert(column);
+
+    struct ovsdb_monitor_changes *changes;
+    HMAP_FOR_EACH_WITH_HASH(changes, hmap_node, hash, &column->changes) {
+        if (ovsdb_datum_equals(&clause->arg, &changes->arg,
+                               &clause->column->type)) {
+            break;
+        }
+    }
+
+    return changes;
+}
+
+static void
+ovsdb_monitor_clauses_changes_update(const struct ovsdb_row *old,
+                                     const struct ovsdb_row *new,
+                                     struct ovsdb_monitor_table *mt)
+{
+    struct shash_node *node;
+    struct ovsdb_monitor_changes *changes;
+
+    /* Insert row to tracked columns */
+    SHASH_FOR_EACH(node, &mt->trk_clauses) {
+        struct ovsdb_tracked_clauses *c = node->data;
+        size_t hash;
+
+        if (old) {
+            hash = ovsdb_datum_hash(&old->fields[c->column->index],
+                                    &c->column->type, 0);
+
+            HMAP_FOR_EACH_WITH_HASH(changes, hmap_node, hash, &c->changes) {
+                if (ovsdb_datum_equals(&old->fields[c->column->index],
+                                       &changes->arg, &c->column->type)) {
+                    ovsdb_monitor_changes_update(old, new, mt, changes,
+                                                 mt->dbmon->n_transactions);
+                }
+            }
+        }
+        if (new) {
+            if (old && ovsdb_datum_equals(&old->fields[c->column->index],
+                                          &new->fields[c->column->index],
+                                          &c->column->type)) {
+                continue;
+            }
+            hash = ovsdb_datum_hash(&new->fields[c->column->index],
+                                    &c->column->type, 0);
+            HMAP_FOR_EACH_WITH_HASH(changes, hmap_node, hash, &c->changes) {
+                /* Insert to changes if old or new match match datum */
+                if (ovsdb_datum_equals(&new->fields[c->column->index],
+                                       &changes->arg, &c->column->type)) {
+                    ovsdb_monitor_changes_update(old, new, mt, changes,
+                                                 mt->dbmon->n_transactions);
+                }
+            }
+        }
     }
 }
 

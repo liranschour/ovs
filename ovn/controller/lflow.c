@@ -307,7 +307,7 @@ lflow_init(void)
 /* Translates logical flows in the Logical_Flow table in the OVN_SB database
  * into OpenFlow flows.  See ovn-architecture(7) for more information. */
 void
-lflow_run(struct controller_ctx *ctx, struct hmap *flow_table,
+lflow_run(struct controller_ctx *ctx,
           const struct simap *ct_zones,
           struct hmap *local_datapaths)
 {
@@ -317,7 +317,25 @@ lflow_run(struct controller_ctx *ctx, struct hmap *flow_table,
     ldp_run(ctx);
 
     const struct sbrec_logical_flow *lflow;
-    SBREC_LOGICAL_FLOW_FOR_EACH (lflow, ctx->ovnsb_idl) {
+    SBREC_LOGICAL_FLOW_FOR_EACH_TRACKED (lflow, ctx->ovnsb_idl) {
+        unsigned int del_seqno = sbrec_logical_flow_row_get_seqno(lflow,
+            OVSDB_IDL_CHANGE_DELETE);
+        unsigned int mod_seqno = sbrec_logical_flow_row_get_seqno(lflow,
+            OVSDB_IDL_CHANGE_MODIFY);
+        unsigned int ins_seqno = sbrec_logical_flow_row_get_seqno(lflow,
+            OVSDB_IDL_CHANGE_INSERT);
+        // this offset is to protect the hard coded rules in physical.c
+        ins_seqno += 4;
+
+        /* if the row has a del_seqno > 0, then trying to process the
+         * row isn't going to work (as it has already been freed).
+         * Therefore all we can do is to pass the ins_seqno to 
+         * ofctrl_remove_flow() to remove the flow */
+        if (del_seqno > 0) {
+            ofctrl_remove_flow(ins_seqno);
+            continue;
+        }
+
         /* Find the "struct logical_datapath" associated with this
          * Logical_Flow row.  If there's no such struct, that must be because
          * no logical ports are bound to that logical datapath, so there's no
@@ -431,8 +449,8 @@ lflow_run(struct controller_ctx *ctx, struct hmap *flow_table,
                 m->match.flow.conj_id += conj_id_ofs;
             }
             if (!m->n) {
-                ofctrl_add_flow(flow_table, ptable, lflow->priority,
-                                &m->match, &ofpacts);
+                ofctrl_add_flow(ptable, lflow->priority, &m->match, &ofpacts,
+                                ins_seqno, mod_seqno);
             } else {
                 uint64_t conj_stubs[64 / 8];
                 struct ofpbuf conj;
@@ -447,8 +465,8 @@ lflow_run(struct controller_ctx *ctx, struct hmap *flow_table,
                     dst->clause = src->clause;
                     dst->n_clauses = src->n_clauses;
                 }
-                ofctrl_add_flow(flow_table, ptable, lflow->priority,
-                                &m->match, &conj);
+                ofctrl_add_flow(ptable, lflow->priority, &m->match, &conj,
+                                ins_seqno, mod_seqno);
                 ofpbuf_uninit(&conj);
             }
         }

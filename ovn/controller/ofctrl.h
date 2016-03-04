@@ -30,12 +30,17 @@ struct ovsrec_bridge;
 /* Interface for OVN main loop. */
 void ofctrl_init(void);
 enum mf_field_id ofctrl_run(const struct ovsrec_bridge *br_int);
-void ofctrl_put(struct hmap *flows);
+void ofctrl_put(void);
 void ofctrl_wait(void);
 void ofctrl_destroy(void);
 
-/* Flow table interface to the rest of ovn-controller. */
-void ofctrl_add_flow(struct hmap *flows, uint8_t table_id, uint16_t priority,
-                     const struct match *, const struct ofpbuf *ofpacts);
+struct ovn_flow *ofctrl_dup_flow(struct ovn_flow *source);
+
+/* Flow table interfaces to the rest of ovn-controller. */
+void ofctrl_add_flow(uint8_t table_id, uint16_t priority,
+                     const struct match *, const struct ofpbuf *ofpacts,
+                     unsigned int ins_seqno, unsigned int mod_seqno);
+
+void ofctrl_remove_flow(unsigned int ins_seqno);
 
 #endif /* ovn/ofctrl.h */

@@ -7309,6 +7309,18 @@ ofpacts_equal(const struct ofpact *a, size_t a_len,
     return a_len == b_len && !memcmp(a, b, a_len);
 }
 
+uint32_t
+ofpacts_hash(const struct ofpact *a, size_t a_len, uint32_t basis)
+{
+    size_t i;
+    uint32_t interim = basis;
+    for (i = 0; i < a_len; i += 4) {
+         uint32_t *term = (uint32_t *) ((uint8_t *)a+i);
+         interim = hash_add(*term, interim);
+    }
+    return hash_finish(interim, a_len);
+}
+
 /* Finds the OFPACT_METER action, if any, in the 'ofpacts_len' bytes of
  * 'ofpacts'.  If found, returns its meter ID; if not, returns 0.
  *

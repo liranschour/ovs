@@ -614,7 +614,6 @@ struct ofpact_learn_spec {
     struct mf_subfield dst;   /* NX_LEARN_DST_MATCH, NX_LEARN_DST_LOAD only. */
 };
 
-
 /* Bits for 'flags' in struct nx_action_learn.
  *
  * If NX_LEARN_F_SEND_FLOW_REM is set, then the learned flows will have their
@@ -885,6 +884,8 @@ bool ofpacts_output_to_group(const struct ofpact[], size_t ofpacts_len,
                              uint32_t group_id);
 bool ofpacts_equal(const struct ofpact a[], size_t a_len,
                    const struct ofpact b[], size_t b_len);
+uint32_t ofpacts_hash(const struct ofpact a[], size_t a_len, uint32_t basis);
+
 const struct mf_field *ofpact_get_mf_dst(const struct ofpact *ofpact);
 uint32_t ofpacts_get_meter(const struct ofpact[], size_t ofpacts_len);
 

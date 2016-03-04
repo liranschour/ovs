@@ -260,6 +260,9 @@ main(int argc, char *argv[])
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
 
+    /* track the southbound idl */
+    ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
+
     struct ovsdb_idl_condition binding_cond;
     ovsdb_idl_condition_init(&binding_cond, &sbrec_table_port_binding);
     sbrec_port_binding_add_clause_false(&binding_cond);
@@ -318,15 +321,13 @@ main(int argc, char *argv[])
 
             pinctrl_run(&ctx, br_int);
 
-            struct hmap flow_table = HMAP_INITIALIZER(&flow_table);
-            lflow_run(&ctx, &flow_table, &ct_zones, &local_datapaths);
+            lflow_run(&ctx, &ct_zones, &local_datapaths);
             if (chassis_id) {
                 physical_run(&ctx, mff_ovn_geneve,
-                             br_int, chassis_id, &ct_zones, &flow_table,
+                             br_int, chassis_id, &ct_zones, 
                              &local_datapaths);
             }
-            ofctrl_put(&flow_table);
-            hmap_destroy(&flow_table);
+            ofctrl_put();
         }
 
         struct local_datapath *cur_node, *next_node;

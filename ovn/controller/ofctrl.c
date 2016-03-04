@@ -37,19 +37,28 @@ VLOG_DEFINE_THIS_MODULE(ofctrl);
 /* An OpenFlow flow. */
 struct ovn_flow {
     /* Key. */
-    struct hmap_node hmap_node;
+    struct hmap_node match_hmap_node; /* for match based hashing */
+    struct hmap_node action_hmap_node; /* for action based hashing */
+    struct hmap_node seqno_hmap_node; /* for seqno based hashing */
     uint8_t table_id;
     uint16_t priority;
-    struct match match;
+    unsigned int ins_seqno;
 
     /* Data. */
+    struct match match;
     struct ofpact *ofpacts;
     size_t ofpacts_len;
 };
 
-static uint32_t ovn_flow_hash(const struct ovn_flow *);
-static struct ovn_flow *ovn_flow_lookup(struct hmap *flow_table,
-                                        const struct ovn_flow *target);
+static uint32_t ovn_flow_match_hash(const struct ovn_flow *);
+static uint32_t ovn_flow_action_hash(const struct ovn_flow *);
+static uint32_t ovn_flow_seqno_hash(const struct ovn_flow *);
+static struct ovn_flow *ovn_flow_lookup_by_action(struct hmap *,
+    const struct ovn_flow *target);
+static struct ovn_flow *ovn_flow_lookup_by_match(struct hmap *,
+    const struct ovn_flow *target);
+static struct ovn_flow *ovn_flow_lookup_by_seqno(struct hmap *,
+    const struct ovn_flow *target);
 static char *ovn_flow_to_string(const struct ovn_flow *);
 static void ovn_flow_log(const struct ovn_flow *, const char *action);
 static void ovn_flow_destroy(struct ovn_flow *);
@@ -97,10 +106,14 @@ static struct hmap installed_flows;
  * S_CLEAR_FLOWS or S_UPDATE_FLOWS, this is really the option we have. */
 static enum mf_field_id mff_ovn_geneve;
 
-static void ovn_flow_table_clear(struct hmap *flow_table);
-static void ovn_flow_table_destroy(struct hmap *flow_table);
+static void ovn_flow_table_clear(void);
+static void ovn_flow_table_destroy(void);
 
 static void ofctrl_recv(const struct ofp_header *, enum ofptype);
+
+struct hmap match_flow_table = HMAP_INITIALIZER(&match_flow_table);
+struct hmap action_flow_table = HMAP_INITIALIZER(&action_flow_table);
+struct hmap seqno_flow_table = HMAP_INITIALIZER(&seqno_flow_table);
 
 void
 ofctrl_init(void)
@@ -310,7 +323,7 @@ run_S_CLEAR_FLOWS(void)
     VLOG_DBG("clearing all flows");
 
     /* Clear installed_flows, to match the state of the switch. */
-    ovn_flow_table_clear(&installed_flows);
+    ovn_flow_table_clear();
 
     state = S_UPDATE_FLOWS;
 }
@@ -428,7 +441,7 @@ void
 ofctrl_destroy(void)
 {
     rconn_destroy(swconn);
-    ovn_flow_table_destroy(&installed_flows);
+    ovn_flow_table_destroy();
     rconn_packet_counter_destroy(tx_counter);
 }
 
@@ -461,67 +474,222 @@ ofctrl_recv(const struct ofp_header *oh, enum ofptype type)
     }
 }
 
-/* Flow table interface to the rest of ovn-controller. */
+/* Flow table interfaces to the rest of ovn-controller. */
 
-/* Adds a flow to 'desired_flows' with the specified 'match' and 'actions' to
+/* Adds a flow to flow tables with the specified 'match' and 'actions' to
  * the OpenFlow table numbered 'table_id' with the given 'priority'.  The
  * caller retains ownership of 'match' and 'actions'.
  *
- * This just assembles the desired flow table in memory.  Nothing is actually
+ * Because it is possible for both actions and matches to change on a rule,
+ * and because the hmap struct only supports a single hash, this method
+ * uses two hash maps - one that uses table_id+priority+matches for its hash
+ * and the other that uses table_id+priority+actions.
+ *
+ * This just assembles the desired flow tables in memory.  Nothing is actually
  * sent to the switch until a later call to ofctrl_run().
  *
- * The caller should initialize its own hmap to hold the flows. */
+ * The caller should initialize its own hmaps to hold the flows. */
 void
-ofctrl_add_flow(struct hmap *desired_flows,
-                uint8_t table_id, uint16_t priority,
-                const struct match *match, const struct ofpbuf *actions)
+ofctrl_add_flow(uint8_t table_id, uint16_t priority,
+                const struct match *match, const struct ofpbuf *actions,
+                unsigned int ins_seqno, unsigned int mod_seqno)
 {
+    // structure that uses table_id+priority+various things as hashes
     struct ovn_flow *f = xmalloc(sizeof *f);
     f->table_id = table_id;
     f->priority = priority;
     f->match = *match;
     f->ofpacts = xmemdup(actions->data, actions->size);
     f->ofpacts_len = actions->size;
-    f->hmap_node.hash = ovn_flow_hash(f);
+    f->ins_seqno = ins_seqno;
+    f->match_hmap_node.hash = ovn_flow_match_hash(f);
+    f->action_hmap_node.hash = ovn_flow_action_hash(f);
+    f->seqno_hmap_node.hash = ovn_flow_seqno_hash(f);
 
-    if (ovn_flow_lookup(desired_flows, f)) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
-        if (!VLOG_DROP_INFO(&rl)) {
-            char *s = ovn_flow_to_string(f);
-            VLOG_INFO("dropping duplicate flow: %s", s);
-            free(s);
+    char *s = ovn_flow_to_string(f);
+    VLOG_INFO("considering potential new flow: %s (%d %d)", s, ins_seqno, mod_seqno);
+    free(s);
+    /* if mod_seqno > 0 then this is a modify operation, so look up
+     * the old flow via the match hash.  If you can't find it,
+     * then look up via the action hash. */
+   
+    if (mod_seqno > 0) {
+        struct ovn_flow *d = ovn_flow_lookup_by_match(&match_flow_table, f);
+        if (!d) {
+            d = ovn_flow_lookup_by_action(&action_flow_table, f);
         }
 
-        ovn_flow_destroy(f);
-        return;
-    }
+        if (d) {
+            hmap_remove(&match_flow_table, &d->match_hmap_node);
+            hmap_remove(&action_flow_table, &d->action_hmap_node);
+            hmap_remove(&seqno_flow_table, &d->seqno_hmap_node);
+            ovn_flow_destroy(d);
+        }
+    } else {
+        /* this is an insert operation, so check to see if this 
+         * is a duplicate via the match hash.  If so, then 
+         * check if the actions have changed.  If it is a complete
+         * duplicate (i.e. the actions are the same) drop the new
+         * flow. If not, then drop the old flow as superseded.
+         * If the new rule is not a duplicate, check the action
+         * hash to see if this flow is superseding a previous
+         * flow and if so, drop the old flow and insert the
+         * new one */
 
-    hmap_insert(desired_flows, &f->hmap_node, f->hmap_node.hash);
+        struct ovn_flow *d = ovn_flow_lookup_by_match(&match_flow_table, f);
+
+        if (d) {
+            if (ofpacts_equal(f->ofpacts, f->ofpacts_len,
+                              d->ofpacts, d->ofpacts_len)) {
+                ovn_flow_destroy(f);
+                return;
+            }
+            hmap_remove(&match_flow_table, &d->match_hmap_node);
+            hmap_remove(&action_flow_table, &d->action_hmap_node);
+            hmap_remove(&seqno_flow_table, &d->seqno_hmap_node);
+            ovn_flow_destroy(d);
+        } else {
+            d = ovn_flow_lookup_by_action(&action_flow_table, f);
+            if (d) {
+                hmap_remove(&match_flow_table, &d->match_hmap_node);
+                hmap_remove(&action_flow_table, &d->action_hmap_node);
+                hmap_remove(&seqno_flow_table, &d->seqno_hmap_node);
+                ovn_flow_destroy(d);
+            }
+        }
+    }
+    hmap_insert(&match_flow_table, &f->match_hmap_node,
+                f->match_hmap_node.hash);
+    hmap_insert(&action_flow_table, &f->action_hmap_node,
+                f->action_hmap_node.hash);
+    hmap_insert(&seqno_flow_table, &f->seqno_hmap_node,
+                f->seqno_hmap_node.hash);
 }
+
+/* removes a flow from the flow table */
+
+void
+ofctrl_remove_flow(unsigned int ins_seqno)
+{
+    // structure that uses table_id+priority+various things as hashes
+    struct ovn_flow *f = xmalloc(sizeof *f);
+    f->ins_seqno = ins_seqno;
+    f->ofpacts = NULL;
+    f->seqno_hmap_node.hash = ovn_flow_seqno_hash(f);
+
+    struct ovn_flow *d = ovn_flow_lookup_by_seqno(&seqno_flow_table, f);
+    if (d) {
+        hmap_remove(&match_flow_table, &d->match_hmap_node);
+        hmap_remove(&action_flow_table, &d->action_hmap_node);
+        hmap_remove(&seqno_flow_table, &d->seqno_hmap_node);
+        ovn_flow_destroy(d);
+    }
+    ovn_flow_destroy(f);
+}
+
 
 /* ovn_flow. */
 
-/* Returns a hash of the key in 'f'. */
+/* duplicate an ovn_flow structure */
+struct ovn_flow *
+ofctrl_dup_flow(struct ovn_flow *source)
+{
+    struct ovn_flow *answer = xmalloc(sizeof *answer);
+    answer->table_id = source->table_id;
+    answer->priority = source->priority;
+    answer->match = source->match;
+    answer->ofpacts = xmemdup(source->ofpacts, source->ofpacts_len);
+    answer->ofpacts_len = source->ofpacts_len;
+    answer->ins_seqno = source->ins_seqno;
+    answer->match_hmap_node.hash = ovn_flow_match_hash(answer);
+    answer->action_hmap_node.hash = ovn_flow_action_hash(answer);
+    answer->seqno_hmap_node.hash = ovn_flow_seqno_hash(answer);
+    return answer;
+}
+
+/* Returns a hash of the match key in 'f'. */
 static uint32_t
-ovn_flow_hash(const struct ovn_flow *f)
+ovn_flow_match_hash(const struct ovn_flow *f)
 {
     return hash_2words((f->table_id << 16) | f->priority,
                        match_hash(&f->match, 0));
+}
 
+/* Returns a hash of the action key in 'f'. */
+static uint32_t
+ovn_flow_action_hash(const struct ovn_flow *f)
+{
+    return hash_2words((f->table_id << 16) | f->priority,
+                       ofpacts_hash(f->ofpacts, f->ofpacts_len, 0));
+}
+
+/* Returns a hash of the seqno key in 'f'. */
+static uint32_t
+ovn_flow_seqno_hash(const struct ovn_flow *f)
+{
+  return hash_int(f->ins_seqno, 8);
 }
 
 /* Finds and returns an ovn_flow in 'flow_table' whose key is identical to
- * 'target''s key, or NULL if there is none. */
+ * 'target''s key, or NULL if there is none, using the match hashmap. */
 static struct ovn_flow *
-ovn_flow_lookup(struct hmap *flow_table, const struct ovn_flow *target)
+ovn_flow_lookup_by_match(struct hmap* flow_table,
+                         const struct ovn_flow *target)
 {
     struct ovn_flow *f;
 
-    HMAP_FOR_EACH_WITH_HASH (f, hmap_node, target->hmap_node.hash,
+    HMAP_FOR_EACH_WITH_HASH (f, match_hmap_node, target->match_hmap_node.hash,
                              flow_table) {
         if (f->table_id == target->table_id
             && f->priority == target->priority
             && match_equal(&f->match, &target->match)) {
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* Finds and returns an ovn_flow in 'flow_table' whose key is identical to
+ * 'target''s key, or NULL if there is none, using the seqno hashmap. */
+static struct ovn_flow *
+ovn_flow_lookup_by_seqno(struct hmap* flow_table,
+                         const struct ovn_flow *target)
+{
+    struct ovn_flow *f;
+
+    HMAP_FOR_EACH_WITH_HASH (f, seqno_hmap_node, target->seqno_hmap_node.hash,
+                             flow_table) {
+        if (f->ins_seqno == target->ins_seqno) {
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* Finds and returns an ovn_flow in 'flow_table' whose key is identical to
+ * 'target''s key, or NULL if there is none, using the action hashmap. 
+ * Bescaue this hashmap is fairly coarse, we look for an */
+static struct ovn_flow *
+ovn_flow_lookup_by_action(struct hmap* flow_table,
+                          const struct ovn_flow *target)
+{
+    struct ovn_flow *f;
+
+    HMAP_FOR_EACH_WITH_HASH (f, action_hmap_node,
+                             target->action_hmap_node.hash, flow_table) {
+        if (f->table_id == target->table_id
+            && f->priority == target->priority
+            && (match_equal(&f->match, &target->match)
+                || ((flow_wildcards_has_extra(&f->match.wc,
+                                              &target->match.wc)
+                     && flow_equal_except(&f->match.flow,
+                                          &target->match.flow,
+                                          &f->match.wc))
+                    || (flow_wildcards_has_extra(&target->match.wc,
+                                                 &f->match.wc)
+                        && flow_equal_except(&target->match.flow,
+                                             &f->match.flow,
+                                             &target->match.wc))))) {
             return f;
         }
     }
@@ -554,7 +722,9 @@ static void
 ovn_flow_destroy(struct ovn_flow *f)
 {
     if (f) {
-        free(f->ofpacts);
+        if (f->ofpacts) {
+            free(f->ofpacts);
+        }
         free(f);
     }
 }
@@ -562,20 +732,24 @@ ovn_flow_destroy(struct ovn_flow *f)
 /* Flow tables of struct ovn_flow. */
 
 static void
-ovn_flow_table_clear(struct hmap *flow_table)
+ovn_flow_table_clear(void)
 {
     struct ovn_flow *f, *next;
-    HMAP_FOR_EACH_SAFE (f, next, hmap_node, flow_table) {
-        hmap_remove(flow_table, &f->hmap_node);
+    HMAP_FOR_EACH_SAFE (f, next, match_hmap_node, &match_flow_table) {
+        hmap_remove(&match_flow_table, &f->match_hmap_node);
+        hmap_remove(&action_flow_table, &f->action_hmap_node);
+        hmap_remove(&seqno_flow_table, &f->seqno_hmap_node);
         ovn_flow_destroy(f);
     }
 }
 
 static void
-ovn_flow_table_destroy(struct hmap *flow_table)
+ovn_flow_table_destroy(void)
 {
-    ovn_flow_table_clear(flow_table);
-    hmap_destroy(flow_table);
+    ovn_flow_table_clear();
+    hmap_destroy(&match_flow_table);
+    hmap_destroy(&action_flow_table);
+    hmap_destroy(&seqno_flow_table);
 }
 
 /* Flow table update. */
@@ -595,19 +769,16 @@ queue_flow_mod(struct ofputil_flow_mod *fm)
  * flows from 'flow_table' and frees them.  (The hmap itself isn't
  * destroyed.)
  *
- * This called be called be ofctrl_run() within the main loop. */
+ * This can be called by ofctrl_run() within the main loop. */
 void
-ofctrl_put(struct hmap *flow_table)
+ofctrl_put(void)
 {
     /* The flow table can be updated if the connection to the switch is up and
      * in the correct state and not backlogged with existing flow_mods.  (Our
      * criteria for being backlogged appear very conservative, but the socket
-     * between ovn-controller and OVS provides some buffering.)  Otherwise,
-     * discard the flows.  A solution to either of those problems will cause us
-     * to wake up and retry. */
+     * between ovn-controller and OVS provides some buffering.) */
     if (state != S_UPDATE_FLOWS
         || rconn_packet_counter_n_packets(tx_counter)) {
-        ovn_flow_table_clear(flow_table);
         return;
     }
 
@@ -615,8 +786,8 @@ ofctrl_put(struct hmap *flow_table)
      * longer desired, delete them; if any of them should have different
      * actions, update them. */
     struct ovn_flow *i, *next;
-    HMAP_FOR_EACH_SAFE (i, next, hmap_node, &installed_flows) {
-        struct ovn_flow *d = ovn_flow_lookup(flow_table, i);
+    HMAP_FOR_EACH_SAFE (i, next, match_hmap_node, &installed_flows) {
+        struct ovn_flow *d = ovn_flow_lookup_by_match(&match_flow_table, i);
         if (!d) {
             /* Installed flow is no longer desirable.  Delete it from the
              * switch and from installed_flows. */
@@ -627,9 +798,9 @@ ofctrl_put(struct hmap *flow_table)
                 .command = OFPFC_DELETE_STRICT,
             };
             queue_flow_mod(&fm);
-            ovn_flow_log(i, "removing");
+            ovn_flow_log(i, "removing installed");
 
-            hmap_remove(&installed_flows, &i->hmap_node);
+            hmap_remove(&installed_flows, &i->match_hmap_node);
             ovn_flow_destroy(i);
         } else {
             if (!ofpacts_equal(i->ofpacts, i->ofpacts_len,
@@ -644,40 +815,38 @@ ofctrl_put(struct hmap *flow_table)
                     .command = OFPFC_MODIFY_STRICT,
                 };
                 queue_flow_mod(&fm);
-                ovn_flow_log(i, "updating");
+                ovn_flow_log(i, "updating installed");
 
                 /* Replace 'i''s actions by 'd''s. */
                 free(i->ofpacts);
-                i->ofpacts = d->ofpacts;
+                i->ofpacts = xmemdup(d->ofpacts, d->ofpacts_len);
                 i->ofpacts_len = d->ofpacts_len;
-                d->ofpacts = NULL;
-                d->ofpacts_len = 0;
             }
-
-            hmap_remove(flow_table, &d->hmap_node);
-            ovn_flow_destroy(d);
         }
     }
 
-    /* The previous loop removed from 'flow_table' all of the flows that are
-     * already installed.  Thus, any flows remaining in 'flow_table' need to
-     * be added to the flow table. */
+    /* Iterate through the new flows and add those that aren't found
+     * in the installed flow table */
     struct ovn_flow *d;
-    HMAP_FOR_EACH_SAFE (d, next, hmap_node, flow_table) {
-        /* Send flow_mod to add flow. */
-        struct ofputil_flow_mod fm = {
-            .match = d->match,
-            .priority = d->priority,
-            .table_id = d->table_id,
-            .ofpacts = d->ofpacts,
-            .ofpacts_len = d->ofpacts_len,
-            .command = OFPFC_ADD,
-        };
-        queue_flow_mod(&fm);
-        ovn_flow_log(d, "adding");
+    HMAP_FOR_EACH_SAFE (d, next, match_hmap_node, &match_flow_table) {
+        struct ovn_flow *i = ovn_flow_lookup_by_match(&installed_flows, d);
+        if (!i) {
+            /* Send flow_mod to add flow. */
+            struct ofputil_flow_mod fm = {
+                .match = d->match,
+                .priority = d->priority,
+                .table_id = d->table_id,
+                .ofpacts = d->ofpacts,
+                .ofpacts_len = d->ofpacts_len,
+                .command = OFPFC_ADD,
+            };
+            queue_flow_mod(&fm);
+            ovn_flow_log(d, "adding installed");
 
-        /* Move 'd' from 'flow_table' to installed_flows. */
-        hmap_remove(flow_table, &d->hmap_node);
-        hmap_insert(&installed_flows, &d->hmap_node, d->hmap_node.hash);
+            /* Copy 'd' from 'flow_table' to installed_flows. */
+            struct ovn_flow *new_node = ofctrl_dup_flow(d);
+            hmap_insert(&installed_flows, &new_node->match_hmap_node,
+                        new_node->match_hmap_node.hash);
+        }
     }
 }

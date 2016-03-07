@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 Nicira, Inc.
+/*te Copyright (c) 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -241,27 +241,136 @@ ldp_free(struct logical_datapath *ldp)
     free(ldp);
 }
 
+/* Whether a particular port has been seen or not
+ *
+ * the hmap_node is based on the name string, while the logical
+ * datapath pointer handles back cleanup */
+struct ldp_port {
+    struct hmap_node hmap_node; /* Indexed on 'ins_seqno'. */
+    uint32_t ins_seqno;
+    char *name;
+    struct logical_datapath *ldp;   /* Associated logical datapath */
+};
+
+struct hmap ldp_ports = HMAP_INITIALIZER(&ldp_ports);
+
+void
+ldp_port_create(uint32_t ins_seqno, char *name, struct logical_datapath *ldp)
+{
+    struct ldp_port *psp;
+
+    psp = xmalloc(sizeof *psp);
+    psp->ins_seqno = ins_seqno;
+    psp->name = xmemdup(name, strlen(name));
+    psp->ldp = ldp;
+    psp->hmap_node.hash = hash_int(ins_seqno, 0);
+    hmap_insert(&ldp_ports, &psp->hmap_node, psp->hmap_node.hash);
+}
+
+static struct ldp_port *
+ldp_port_lookup(uint32_t ins_seqno)
+{
+    struct ldp_port *psp;
+    HMAP_FOR_EACH_IN_BUCKET (psp, hmap_node, hash_int(ins_seqno, 0),
+                             &ldp_ports) {
+        if (ins_seqno == psp->ins_seqno) {
+            return psp;
+        }
+    }
+    return NULL;
+}
+
+void
+ldp_port_update(uint32_t ins_seqno, char *name, struct logical_datapath *ldp)
+{
+    struct ldp_port *ldpp = ldp_port_lookup(ins_seqno);
+    if (!ldpp) {
+        ldp_port_create(ins_seqno, name, ldp);
+    }
+}
+
+static void
+ldp_port_free(struct ldp_port *psp)
+{
+    if (psp->name) {
+        free(psp->name);
+    }
+    free(psp);
+}
+
 /* Iterates through all of the records in the Port_Binding table, updating the
  * table of logical_datapaths to match the values found in active
  * Port_Bindings. */
 static void
 ldp_run(struct controller_ctx *ctx)
 {
-    struct logical_datapath *ldp;
+    struct logical_datapath *ldp = NULL;
     HMAP_FOR_EACH (ldp, hmap_node, &logical_datapaths) {
         simap_clear(&ldp->ports);
     }
 
     const struct sbrec_port_binding *binding;
-    SBREC_PORT_BINDING_FOR_EACH (binding, ctx->ovnsb_idl) {
+    SBREC_PORT_BINDING_FOR_EACH_TRACKED (binding, ctx->ovnsb_idl) {
+        unsigned int del_seqno = sbrec_port_binding_row_get_seqno(binding,
+            OVSDB_IDL_CHANGE_DELETE);
+        unsigned int ins_seqno = sbrec_port_binding_row_get_seqno(binding,
+            OVSDB_IDL_CHANGE_INSERT);
+
+        /* if the row has a del_seqno > 0, then trying to process the row
+         * isn't going to work (as it has already been freed). */
+        if (del_seqno > 0) {
+            struct ldp_port *oldp = ldp_port_lookup(ins_seqno);
+            if (oldp) {
+                struct simap_node *old = simap_find(&oldp->ldp->ports,
+                                                    oldp->name);
+                if (old) {
+                    simap_delete(&oldp->ldp->ports, old);
+                }
+                hmap_remove(&ldp_ports, &oldp->hmap_node);
+                ldp_port_free(oldp);
+            }
+            continue;
+        } 
+
         struct logical_datapath *ldp = ldp_lookup_or_create(ctx, binding->datapath);
-        simap_put(&ldp->ports, binding->logical_port, binding->tunnel_key);
+        struct simap_node *old = simap_find(&ldp->ports,
+                                            binding->logical_port);
+        if (!old || old->data != binding->tunnel_key) {
+            simap_put(&ldp->ports, binding->logical_port, binding->tunnel_key);
+        }
+       
+        ldp_port_update(ins_seqno, binding->logical_port, ldp);
     }
 
     const struct sbrec_multicast_group *mc;
-    SBREC_MULTICAST_GROUP_FOR_EACH (mc, ctx->ovnsb_idl) {
+    SBREC_MULTICAST_GROUP_FOR_EACH_TRACKED (mc, ctx->ovnsb_idl) {
+        unsigned int del_seqno = sbrec_multicast_group_row_get_seqno(mc,
+            OVSDB_IDL_CHANGE_DELETE);
+        unsigned int ins_seqno = sbrec_multicast_group_row_get_seqno(mc,
+            OVSDB_IDL_CHANGE_INSERT);
+
+        /* if the row has a del_seqno > 0, then trying to process the row
+         * isn't going to work (as it has already been freed). */
+        if (del_seqno > 0) {
+            struct ldp_port *oldp = ldp_port_lookup(ins_seqno);
+            if (oldp) {
+                struct simap_node *old = simap_find(&oldp->ldp->ports,
+                                                    oldp->name);
+                if (old) {
+                    simap_delete(&oldp->ldp->ports, old);
+                }
+                hmap_remove(&ldp_ports, &oldp->hmap_node);
+                ldp_port_free(oldp);
+            }
+            continue;
+        }
+
         struct logical_datapath *ldp = ldp_lookup_or_create(ctx, mc->datapath);
-        simap_put(&ldp->ports, mc->name, mc->tunnel_key);
+        struct simap_node *old = simap_find(&ldp->ports, mc->name);
+        if (!old || old->data != mc->tunnel_key) {
+            simap_put(&ldp->ports, mc->name, mc->tunnel_key);
+        }
+        ldp_port_update(ins_seqno, mc->name, ldp);
     }
 
     struct logical_datapath *next_ldp;
@@ -329,7 +438,7 @@ lflow_run(struct controller_ctx *ctx,
 
         /* if the row has a del_seqno > 0, then trying to process the
          * row isn't going to work (as it has already been freed).
-         * Therefore all we can do is to pass the ins_seqno to 
+         * Therefore all we can do is to pass the ins_seqno to
          * ofctrl_remove_flow() to remove the flow */
         if (del_seqno > 0) {
             ofctrl_remove_flow(ins_seqno);

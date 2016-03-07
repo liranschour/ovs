@@ -15,6 +15,7 @@
 
 #include <config.h>
 #include "binding.h"
+#include "lflow.h"
 
 #include "lib/bitmap.h"
 #include "lib/hmap.h"
@@ -141,6 +142,7 @@ remove_local_datapath(struct hmap *local_datapaths, unsigned int ins_seqno)
     if (ld) {
         hmap_remove(local_datapaths, &ld->hmap_node);
         hmap_remove(&local_datapaths_by_seqno, &ld->seqno_hmap_node);
+        reset_flow_processing();
     }
 }
 
@@ -158,6 +160,7 @@ add_local_datapath(struct hmap *local_datapaths,
     hmap_insert(local_datapaths, &ld->hmap_node,
                 binding_rec->datapath->tunnel_key);
     hmap_insert(&local_datapaths_by_seqno, &ld->seqno_hmap_node, ins_seqno);
+    reset_flow_processing();
 }
 
 static void

@@ -43,4 +43,6 @@ void ofctrl_add_flow(uint8_t table_id, uint16_t priority,
 
 void ofctrl_remove_flow(unsigned int ins_seqno);
 
+void ovn_flow_table_clear(void);
+
 #endif /* ovn/ofctrl.h */

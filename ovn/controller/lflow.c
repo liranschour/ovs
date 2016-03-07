@@ -176,6 +176,20 @@ struct logical_datapath {
     enum ldp_type type;         /* Type of logical datapath */
 };
 
+void reset_flow_processing(void);
+void ldp_port_create(uint32_t ins_seqno, char *name,
+                     struct logical_datapath *ldp);
+void ldp_port_update(uint32_t ins_seqno, char *name,
+                     struct logical_datapath *ldp);
+
+bool restart_flow_processing = false;
+
+void
+reset_flow_processing(void)
+{
+    restart_flow_processing = true;
+}
+
 /* Contains "struct logical_datapath"s. */
 static struct hmap logical_datapaths = HMAP_INITIALIZER(&logical_datapaths);
 
@@ -208,6 +222,7 @@ ldp_create(const struct sbrec_datapath_binding *binding)
     const char *ls = smap_get(&binding->external_ids, "logical-switch");
     ldp->type = ls ? LDP_TYPE_SWITCH : LDP_TYPE_ROUTER;
     simap_init(&ldp->ports);
+    reset_flow_processing();
     return ldp;
 }
 
@@ -239,6 +254,7 @@ ldp_free(struct logical_datapath *ldp)
     simap_destroy(&ldp->ports);
     hmap_remove(&logical_datapaths, &ldp->hmap_node);
     free(ldp);
+    reset_flow_processing();
 }
 
 /* Whether a particular port has been seen or not
@@ -337,6 +353,7 @@ ldp_run(struct controller_ctx *ctx)
                                             binding->logical_port);
         if (!old || old->data != binding->tunnel_key) {
             simap_put(&ldp->ports, binding->logical_port, binding->tunnel_key);
+            reset_flow_processing();
         }
        
         ldp_port_update(ins_seqno, binding->logical_port, ldp);
@@ -415,13 +432,21 @@ lflow_init(void)
 
 /* Translates logical flows in the Logical_Flow table in the OVN_SB database
  * into OpenFlow flows.  See ovn-architecture(7) for more information. */
-void
+unsigned int
 lflow_run(struct controller_ctx *ctx,
           const struct simap *ct_zones,
-          struct hmap *local_datapaths)
+          struct hmap *local_datapaths,
+          unsigned int seqno)
 {
     struct hmap flows = HMAP_INITIALIZER(&flows);
     uint32_t conj_id_ofs = 1;
+    unsigned int processed_seqno = seqno;
+
+    if (restart_flow_processing) {
+        seqno = 0;
+        ovn_flow_table_clear();
+        restart_flow_processing = false;
+    }
 
     ldp_run(ctx);
 
@@ -433,17 +458,29 @@ lflow_run(struct controller_ctx *ctx,
             OVSDB_IDL_CHANGE_MODIFY);
         unsigned int ins_seqno = sbrec_logical_flow_row_get_seqno(lflow,
             OVSDB_IDL_CHANGE_INSERT);
-        // this offset is to protect the hard coded rules in physical.c
-        ins_seqno += 4;
-
-        /* if the row has a del_seqno > 0, then trying to process the
-         * row isn't going to work (as it has already been freed).
-         * Therefore all we can do is to pass the ins_seqno to
-         * ofctrl_remove_flow() to remove the flow */
-        if (del_seqno > 0) {
-            ofctrl_remove_flow(ins_seqno);
+        if (del_seqno <= seqno && mod_seqno <= seqno && ins_seqno <= seqno) {
             continue;
         }
+        /* if the row has a del_seqno > 0, then trying to process the
+         * row isn't going to work (as it has already been freed).
+         * Therefore all we can do is to pass the offset ins_seqno to
+         * ofctrl_remove_flow() to remove the flow */
+        if (del_seqno > 0) {
+            ofctrl_remove_flow(ins_seqno+4);
+            if (del_seqno > processed_seqno) {
+                processed_seqno = del_seqno;
+            }
+            continue;
+        }
+        if (mod_seqno > processed_seqno) {
+            processed_seqno = mod_seqno;
+        }
+        if (ins_seqno > processed_seqno) {
+            processed_seqno = ins_seqno;
+        }
+
+        // this offset is to protect the hard coded rules in physical.c
+        ins_seqno += 4;
 
         /* Find the "struct logical_datapath" associated with this
          * Logical_Flow row.  If there's no such struct, that must be because
@@ -579,12 +616,12 @@ lflow_run(struct controller_ctx *ctx,
                 ofpbuf_uninit(&conj);
             }
         }
-
         /* Clean up. */
         expr_matches_destroy(&matches);
         ofpbuf_uninit(&ofpacts);
         conj_id_ofs += n_conjs;
     }
+    return processed_seqno;
 }
 
 void

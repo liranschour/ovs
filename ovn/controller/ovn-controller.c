@@ -208,6 +208,7 @@ main(int argc, char *argv[])
     struct unixctl_server *unixctl;
     bool exiting;
     int retval;
+    unsigned int ovnsb_last_lflow_seqno = 0;
 
     ovs_cmdl_proctitle_init(argc, argv);
     set_program_name(argv[0]);
@@ -321,7 +322,9 @@ main(int argc, char *argv[])
 
             pinctrl_run(&ctx, br_int);
 
-            lflow_run(&ctx, &ct_zones, &local_datapaths);
+            ovnsb_last_lflow_seqno = lflow_run(&ctx, &ct_zones,
+                                               &local_datapaths,
+                                               ovnsb_last_lflow_seqno);
             if (chassis_id) {
                 physical_run(&ctx, mff_ovn_geneve,
                              br_int, chassis_id, &ct_zones, 

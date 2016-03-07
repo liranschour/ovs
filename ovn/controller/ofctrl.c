@@ -106,7 +106,7 @@ static struct hmap installed_flows;
  * S_CLEAR_FLOWS or S_UPDATE_FLOWS, this is really the option we have. */
 static enum mf_field_id mff_ovn_geneve;
 
-static void ovn_flow_table_clear(void);
+void ovn_flow_table_clear(void);
 static void ovn_flow_table_destroy(void);
 
 static void ofctrl_recv(const struct ofp_header *, enum ofptype);
@@ -731,7 +731,7 @@ ovn_flow_destroy(struct ovn_flow *f)
 
 /* Flow tables of struct ovn_flow. */
 
-static void
+void
 ovn_flow_table_clear(void)
 {
     struct ovn_flow *f, *next;

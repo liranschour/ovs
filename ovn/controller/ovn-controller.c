@@ -198,6 +198,10 @@ get_ovnsb_remote(struct ovsdb_idl *ovs_idl)
     }
 }
 
+/* Contains "struct local_datpath" nodes whose hash values are the
+ * tunnel_key of datapaths with at least one local port binding. */
+struct hmap local_datapaths = HMAP_INITIALIZER(&local_datapaths);
+
 int
 main(int argc, char *argv[])
 {
@@ -300,10 +304,6 @@ main(int argc, char *argv[])
             .mgroup_cond_updated = false,
         };
 
-        /* Contains "struct local_datpath" nodes whose hash values are the
-         * tunnel_key of datapaths with at least one local port binding. */
-        struct hmap local_datapaths = HMAP_INITIALIZER(&local_datapaths);
-
         const struct ovsrec_bridge *br_int = get_br_int(&ctx);
         const char *chassis_id = get_chassis_id(ctx.ovs_idl);
 
@@ -329,13 +329,6 @@ main(int argc, char *argv[])
             }
             ofctrl_put();
         }
-
-        struct local_datapath *cur_node, *next_node;
-        HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &local_datapaths) {
-            hmap_remove(&local_datapaths, &cur_node->hmap_node);
-            free(cur_node);
-        }
-        hmap_destroy(&local_datapaths);
 
         unixctl_server_run(unixctl);
 

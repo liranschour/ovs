@@ -123,9 +123,31 @@ update_ct_zones(struct sset *lports, struct simap *ct_zones,
     }
 }
 
+/* Contains "struct local_datpath" nodes whose hash values are the
+ * ins_seqno of datapaths with at least one local port binding. */
+struct hmap local_datapaths_by_seqno =
+    HMAP_INITIALIZER(&local_datapaths_by_seqno);
+
+static struct local_datapath *
+local_datapath_lookup_by_seqno(unsigned int ins_seqno)
+{
+    return hmap_first_with_hash(&local_datapaths_by_seqno, ins_seqno);
+}
+
+static void
+remove_local_datapath(struct hmap *local_datapaths, unsigned int ins_seqno)
+{
+    struct local_datapath *ld = local_datapath_lookup_by_seqno(ins_seqno);
+    if (ld) {
+        hmap_remove(local_datapaths, &ld->hmap_node);
+        hmap_remove(&local_datapaths_by_seqno, &ld->seqno_hmap_node);
+    }
+}
+
 static void
 add_local_datapath(struct hmap *local_datapaths,
-        const struct sbrec_port_binding *binding_rec)
+        const struct sbrec_port_binding *binding_rec,
+        unsigned int ins_seqno)
 {
     if (hmap_first_with_hash(local_datapaths,
                              binding_rec->datapath->tunnel_key)) {
@@ -135,6 +157,7 @@ add_local_datapath(struct hmap *local_datapaths,
     struct local_datapath *ld = xzalloc(sizeof *ld);
     hmap_insert(local_datapaths, &ld->hmap_node,
                 binding_rec->datapath->tunnel_key);
+    hmap_insert(&local_datapaths_by_seqno, &ld->seqno_hmap_node, ins_seqno);
 }
 
 static void
@@ -273,7 +296,19 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
     /* Run through each binding record to see if it is resident on this
      * chassis and update the binding accordingly.  This includes both
      * directly connected logical ports and children of those ports. */
-    SBREC_PORT_BINDING_FOR_EACH(binding_rec, ctx->ovnsb_idl) {
+    SBREC_PORT_BINDING_FOR_EACH_TRACKED(binding_rec, ctx->ovnsb_idl) {
+        unsigned int del_seqno = sbrec_port_binding_row_get_seqno(binding_rec,
+            OVSDB_IDL_CHANGE_DELETE);
+        unsigned int ins_seqno = sbrec_port_binding_row_get_seqno(binding_rec,
+            OVSDB_IDL_CHANGE_INSERT);
+
+        /* if the row has a del_seqno > 0, then trying to process the row
+         * isn't going to work (as it has already been freed) */
+        if (del_seqno > 0) {
+            remove_local_datapath(local_datapaths, ins_seqno);
+            continue;
+        }
+
         const char *peer = smap_get(&binding_rec->options, "peer");
         if (peer) {
             add_peer_port(ctx, peer);
@@ -287,7 +322,7 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
                 /* Add child logical port to the set of all local ports. */
                 sset_add(&all_lports, binding_rec->logical_port);
             }
-            add_local_datapath(local_datapaths, binding_rec);
+            add_local_datapath(local_datapaths, binding_rec, ins_seqno);
             if (iface_rec && ctx->ovs_idl_txn) {
                 update_qos(iface_rec, binding_rec);
             }

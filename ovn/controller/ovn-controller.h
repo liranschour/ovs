@@ -44,6 +44,7 @@ struct controller_ctx {
  * the localnet port */
 struct local_datapath {
     struct hmap_node hmap_node;
+    struct hmap_node seqno_hmap_node;
     const struct sbrec_port_binding *localnet_port;
 };
 

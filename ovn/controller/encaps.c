@@ -115,40 +115,6 @@ static void
 tunnel_add(struct tunnel_ctx *tc, const char *new_chassis_id,
            const struct sbrec_encap *encap)
 {
-    struct port_hash_node *hash_node;
-
-    /* Check whether such a row already exists in OVS.  If so, remove it
-     * from 'tc->tunnel_hmap' and we're done. */
-    HMAP_FOR_EACH_WITH_HASH (hash_node, node,
-                             port_hash(new_chassis_id,
-                                       encap->type, encap->ip),
-                             &tc->tunnel_hmap) {
-        const struct ovsrec_port *port = hash_node->port;
-        const char *chassis_id = smap_get(&port->external_ids,
-                                          "ovn-chassis-id");
-        const struct ovsrec_interface *iface;
-        const char *ip;
-
-        if (!chassis_id || !port->n_interfaces) {
-            continue;
-        }
-
-        iface = port->interfaces[0];
-        ip = smap_get(&iface->options, "remote_ip");
-        if (!ip) {
-            continue;
-        }
-
-        if (!strcmp(new_chassis_id, chassis_id)
-            && !strcmp(encap->type, iface->type)
-            && !strcmp(encap->ip, ip)) {
-            hmap_remove(&tc->tunnel_hmap, &hash_node->node);
-            free(hash_node);
-            return;
-        }
-    }
-
-    /* No such port, so add one. */
     struct smap options = SMAP_INITIALIZER(&options);
     struct ovsrec_port *port, **ports;
     struct ovsrec_interface *iface;
@@ -224,6 +190,19 @@ preferred_encap(const struct sbrec_chassis *chassis_rec)
     return best_encap;
 }
 
+unsigned int encaps_seqno = 0;
+
+struct tunnel_ctx tc = {
+    .tunnel_hmap = HMAP_INITIALIZER(&tc.tunnel_hmap),
+    .port_names = SSET_INITIALIZER(&tc.port_names),
+};
+
+static struct port_hash_node *
+port_lookup(unsigned int seqno)
+{
+    return hmap_first_with_hash(&tc.tunnel_hmap, seqno);
+}
+
 void
 encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
            const char *chassis_id)
@@ -235,12 +214,7 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
     const struct sbrec_chassis *chassis_rec;
     const struct ovsrec_bridge *br;
 
-    struct tunnel_ctx tc = {
-        .tunnel_hmap = HMAP_INITIALIZER(&tc.tunnel_hmap),
-        .port_names = SSET_INITIALIZER(&tc.port_names),
-        .br_int = br_int
-    };
-
+    tc.br_int = br_int;
     tc.ovs_txn = ctx->ovs_idl_txn;
     ovsdb_idl_txn_add_comment(tc.ovs_txn,
                               "ovn-controller: modifying OVS tunnels '%s'",
@@ -267,27 +241,62 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
         }
     }
 
-    SBREC_CHASSIS_FOR_EACH(chassis_rec, ctx->ovnsb_idl) {
-        if (strcmp(chassis_rec->name, chassis_id)) {
-            /* Create tunnels to the other chassis. */
-            const struct sbrec_encap *encap = preferred_encap(chassis_rec);
-            if (!encap) {
-                VLOG_INFO("No supported encaps for '%s'", chassis_rec->name);
-                continue;
+    SBREC_CHASSIS_FOR_EACH_TRACKED(chassis_rec, ctx->ovnsb_idl) {
+        unsigned int del_seqno = sbrec_chassis_row_get_seqno(chassis_rec,
+            OVSDB_IDL_CHANGE_DELETE);
+        unsigned int mod_seqno = sbrec_chassis_row_get_seqno(chassis_rec,
+            OVSDB_IDL_CHANGE_MODIFY);
+        unsigned int ins_seqno = sbrec_chassis_row_get_seqno(chassis_rec,
+            OVSDB_IDL_CHANGE_INSERT);
+
+        if (del_seqno <= encaps_seqno && mod_seqno <= encaps_seqno
+            && ins_seqno <= encaps_seqno) {
+            continue;
+        }
+
+        if (del_seqno > 0) {
+            /* remove the tunnel by looking it up based on its ins_seqno
+             * and be done with it */
+            struct port_hash_node *port_hash = port_lookup(ins_seqno);
+            if (port_hash) {
+                bridge_delete_port(port_hash->bridge, port_hash->port);
+                sset_delete(&tc.port_names, port_hash->port->name);
+                hmap_remove(&tc.tunnel_hmap, &port_hash->node);
+                free(port_hash);
+                reset_flow_processing();
             }
-            tunnel_add(&tc, chassis_rec->name, encap);
+            if (encaps_seqno <= del_seqno) {
+                encaps_seqno = del_seqno;
+            }
+        }
+
+        if (mod_seqno > 0) {
+            if (strcmp(chassis_rec->name, chassis_id)) {
+                /* find the tunnel by looking it up based on its ins_seqno
+                 * and then change it */
+                ;
+            }
+            if (encaps_seqno <= mod_seqno) {
+                encaps_seqno = mod_seqno;
+            }
+        } else { 
+            if (strcmp(chassis_rec->name, chassis_id)) {
+                /* Create tunnels to the other chassis. */
+                const struct sbrec_encap *encap =
+                    preferred_encap(chassis_rec);
+                if (!encap) {
+                    VLOG_INFO("No supported encaps for '%s'",
+                              chassis_rec->name);
+                    continue;
+                }
+                tunnel_add(&tc, chassis_rec->name, encap);
+                reset_flow_processing();
+            }
+            if (encaps_seqno <= ins_seqno) {
+                encaps_seqno = ins_seqno;
+            }
         }
     }
-
-    /* Delete any existing OVN tunnels that were not still around. */
-    struct port_hash_node *hash_node, *next_hash_node;
-    HMAP_FOR_EACH_SAFE (hash_node, next_hash_node, node, &tc.tunnel_hmap) {
-        hmap_remove(&tc.tunnel_hmap, &hash_node->node);
-        bridge_delete_port(hash_node->bridge, hash_node->port);
-        free(hash_node);
-    }
-    hmap_destroy(&tc.tunnel_hmap);
-    sset_destroy(&tc.port_names);
 }
 
 /* Returns true if the database is all cleaned up, false if more work is

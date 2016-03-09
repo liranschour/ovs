@@ -263,7 +263,7 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
                 sset_delete(&tc.port_names, port_hash->port->name);
                 hmap_remove(&tc.tunnel_hmap, &port_hash->node);
                 free(port_hash);
-                reset_flow_processing();
+                reset_binding_seqno();
             }
             if (encaps_seqno <= del_seqno) {
                 encaps_seqno = del_seqno;
@@ -290,7 +290,7 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
                     continue;
                 }
                 tunnel_add(&tc, chassis_rec->name, encap);
-                reset_flow_processing();
+                reset_binding_seqno();
             }
             if (encaps_seqno <= ins_seqno) {
                 encaps_seqno = ins_seqno;

@@ -52,6 +52,16 @@ binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
                          &ovsrec_interface_col_ingress_policing_burst);
 }
 
+struct sset all_lports = SSET_INITIALIZER(&all_lports);
+
+unsigned int binding_seqno = 0;
+
+void
+reset_binding_seqno(void)
+{
+    binding_seqno = 0;
+}
+
 static void
 get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports)
 {
@@ -75,6 +85,10 @@ get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports)
                 continue;
             }
             shash_add(lports, iface_id, iface_rec);
+            if (!sset_find(&all_lports, iface_id)) {
+                sset_add(&all_lports, iface_id);
+                reset_binding_seqno();
+            }
         }
     }
 }
@@ -132,7 +146,12 @@ struct hmap local_datapaths_by_seqno =
 static struct local_datapath *
 local_datapath_lookup_by_seqno(unsigned int ins_seqno)
 {
-    return hmap_first_with_hash(&local_datapaths_by_seqno, ins_seqno);
+    struct hmap_node *ld = hmap_first_with_hash(&local_datapaths_by_seqno,
+                                                ins_seqno);
+    if (ld) {
+        return CONTAINER_OF(ld, struct local_datapath, seqno_hmap_node);
+    }
+    return NULL;
 }
 
 static void
@@ -140,8 +159,10 @@ remove_local_datapath(struct hmap *local_datapaths, unsigned int ins_seqno)
 {
     struct local_datapath *ld = local_datapath_lookup_by_seqno(ins_seqno);
     if (ld) {
+        sset_find_and_delete(&all_lports, ld->localnet_port->logical_port);
         hmap_remove(local_datapaths, &ld->hmap_node);
         hmap_remove(&local_datapaths_by_seqno, &ld->seqno_hmap_node);
+        free(ld);
         reset_flow_processing();
     }
 }
@@ -284,12 +305,6 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
          * We'll remove our chassis from all port binding records below. */
     }
 
-    struct sset all_lports = SSET_INITIALIZER(&all_lports);
-    struct shash_node *node;
-    SHASH_FOR_EACH (node, &lports) {
-        sset_add(&all_lports, node->name);
-    }
-
     update_lports(ctx, &all_lports);
 
     ovsdb_idl_txn_add_comment(
@@ -302,14 +317,30 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
     SBREC_PORT_BINDING_FOR_EACH_TRACKED(binding_rec, ctx->ovnsb_idl) {
         unsigned int del_seqno = sbrec_port_binding_row_get_seqno(binding_rec,
             OVSDB_IDL_CHANGE_DELETE);
+        unsigned int mod_seqno = sbrec_port_binding_row_get_seqno(binding_rec,
+            OVSDB_IDL_CHANGE_MODIFY);
         unsigned int ins_seqno = sbrec_port_binding_row_get_seqno(binding_rec,
             OVSDB_IDL_CHANGE_INSERT);
+        if (del_seqno <= binding_seqno && mod_seqno <= binding_seqno
+            && ins_seqno <= binding_seqno) {
+            continue;
+        }
 
         /* if the row has a del_seqno > 0, then trying to process the row
          * isn't going to work (as it has already been freed) */
         if (del_seqno > 0) {
             remove_local_datapath(local_datapaths, ins_seqno);
+            if (del_seqno >= binding_seqno) {
+                binding_seqno = del_seqno;
+            }
             continue;
+        }
+
+        if (mod_seqno >= binding_seqno) {
+            binding_seqno = mod_seqno;
+        }
+        if (ins_seqno >= binding_seqno) {
+            binding_seqno = ins_seqno;
         }
 
         const char *peer = smap_get(&binding_rec->options, "peer");
@@ -351,14 +382,9 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
         }
     }
 
-    SHASH_FOR_EACH (node, &lports) {
-        VLOG_DBG("No port binding record for lport %s", node->name);
-    }
-
     update_ct_zones(&all_lports, ct_zones, ct_zone_bitmap);
 
     shash_destroy(&lports);
-    sset_destroy(&all_lports);
 }
 
 /* Returns true if the database is all cleaned up, false if more work is

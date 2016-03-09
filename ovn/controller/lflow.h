@@ -56,6 +56,7 @@ struct uuid;
 #define LOG_PIPELINE_LEN 16
 
 void lflow_init(void);
+void reset_flow_processing(void);
 unsigned int lflow_run(struct controller_ctx *, const struct simap *ct_zones,
                        struct hmap *local_datapaths, unsigned int seqno);
 void lflow_destroy(void);

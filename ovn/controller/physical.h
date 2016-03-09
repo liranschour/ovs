@@ -45,5 +45,7 @@ void physical_run(struct controller_ctx *, enum mf_field_id mff_ovn_geneve,
                   const struct ovsrec_bridge *br_int, const char *chassis_id,
                   const struct simap *ct_zones,
                   struct hmap *local_datapaths);
+void localvif_to_ofports_clear(void);
+void tunnels_clear(void);
 
 #endif /* ovn/physical.h */

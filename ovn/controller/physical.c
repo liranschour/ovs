@@ -144,15 +144,38 @@ get_localnet_port(struct hmap *local_datapaths, int64_t tunnel_key)
     return ld ? ld->localnet_port : NULL;
 }
 
+struct simap localvif_to_ofport = SIMAP_INITIALIZER(&localvif_to_ofport);
+struct hmap tunnels = HMAP_INITIALIZER(&tunnels);
+unsigned int port_binding_seqno = 0;
+
+void
+localvif_to_ofports_clear(void)
+{
+    simap_clear(&localvif_to_ofport);
+}
+
+void
+tunnels_clear(void)
+{
+    struct chassis_tunnel *tun, *next;
+    HMAP_FOR_EACH_SAFE (tun, next, hmap_node, &tunnels) {
+        hmap_remove(&tunnels, &tun->hmap_node);
+        free(tun);
+    }
+}
+
+static void
+reset_physical_seqnos(void)
+{
+    port_binding_seqno = 0;
+}
+
 void
 physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
              const struct ovsrec_bridge *br_int, const char *this_chassis_id,
              const struct simap *ct_zones,
              struct hmap *local_datapaths)
 {
-    struct simap localvif_to_ofport = SIMAP_INITIALIZER(&localvif_to_ofport);
-    struct hmap tunnels = HMAP_INITIALIZER(&tunnels);
-
     for (int i = 0; i < br_int->n_ports; i++) {
         const struct ovsrec_port *port_rec = br_int->ports[i];
         if (!strcmp(port_rec->name, br_int->name)) {
@@ -187,11 +210,21 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             bool is_patch = !strcmp(iface_rec->type, "patch");
             if (is_patch && localnet) {
                 /* localnet patch ports can be handled just like VIFs. */
-                simap_put(&localvif_to_ofport, localnet, ofport);
+                struct simap_node *old = simap_find(&localvif_to_ofport,
+                                                    localnet);
+                if (!old || old->data != ofport) {
+                    simap_put(&localvif_to_ofport, localnet, ofport);
+                    reset_physical_seqnos();
+                }
                 break;
             } else if (is_patch && logpatch) {
                 /* Logical patch ports can be handled just like VIFs. */
-                simap_put(&localvif_to_ofport, logpatch, ofport);
+                struct simap_node *old = simap_find(&localvif_to_ofport,
+                                                    logpatch);
+                if (!old || old->data != ofport) {
+                    simap_put(&localvif_to_ofport, logpatch, ofport);
+                    reset_physical_seqnos();
+                }
                 break;
             } else if (chassis_id) {
                 enum chassis_tunnel_type tunnel_type;
@@ -208,18 +241,39 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
                     continue;
                 }
 
-                struct chassis_tunnel *tun = xmalloc(sizeof *tun);
-                hmap_insert(&tunnels, &tun->hmap_node,
-                            hash_string(chassis_id, 0));
-                tun->chassis_id = chassis_id;
-                tun->ofport = u16_to_ofp(ofport);
-                tun->type = tunnel_type;
+                struct chassis_tunnel *old = chassis_tunnel_find(&tunnels,
+                                                                 chassis_id);
+                if (!old) {
+                    struct chassis_tunnel *tun = xmalloc(sizeof *tun);
+                    hmap_insert(&tunnels, &tun->hmap_node,
+                                hash_string(chassis_id, 0));
+                    tun->chassis_id = chassis_id;
+                    tun->ofport = u16_to_ofp(ofport);
+                    tun->type = tunnel_type;
+                    reset_physical_seqnos();
+                } else {
+                    ofp_port_t new_port = u16_to_ofp(ofport);
+                    if (new_port != old->ofport) {
+                        old->ofport = new_port;
+                        reset_physical_seqnos();
+                    }
+                    if (tunnel_type != old->type) {
+                        old->type = tunnel_type;
+                        reset_physical_seqnos();
+                    }
+                        //reset_physical_seqnos();
+                }
                 break;
             } else {
                 const char *iface_id = smap_get(&iface_rec->external_ids,
                                                 "iface-id");
                 if (iface_id) {
-                    simap_put(&localvif_to_ofport, iface_id, ofport);
+                    struct simap_node *old = simap_find(&localvif_to_ofport,
+                                                        iface_id);
+                    if (!old || old->data != ofport) {
+                        simap_put(&localvif_to_ofport, iface_id, ofport);
+                        reset_physical_seqnos();
+                    }
                 }
             }
         }
@@ -238,17 +292,32 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             OVSDB_IDL_CHANGE_MODIFY);
         unsigned int ins_seqno = sbrec_port_binding_row_get_seqno(binding,
             OVSDB_IDL_CHANGE_INSERT);
-        // this offset is to protect the hard coded rules below
-        ins_seqno += 4;
+
+        if (del_seqno <= port_binding_seqno && mod_seqno <= port_binding_seqno
+            && ins_seqno <= port_binding_seqno) {
+            continue;
+        }
 
         /* if the row has a del_seqno > 0, then trying to process the
          * row isn't going to work (as it has already been freed).
          * Therefore all we can do is to pass the ins_seqno to 
          * ofctrl_remove_flow() to remove the flow */
         if (del_seqno > 0) {
-            ofctrl_remove_flow(ins_seqno);
+            ofctrl_remove_flow(ins_seqno+4);
+            if (del_seqno > port_binding_seqno) {
+                port_binding_seqno = del_seqno;
+            }
             continue;
         }
+        if (mod_seqno > port_binding_seqno) {
+            port_binding_seqno = mod_seqno;
+        }
+        if (ins_seqno > port_binding_seqno) {
+            port_binding_seqno = ins_seqno;
+        }
+
+        // this offset is to protect the hard coded rules below
+        ins_seqno += 4;
 
         /* Find the OpenFlow port for the logical port, as 'ofport'.  This is
          * one of:
@@ -517,17 +586,18 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             OVSDB_IDL_CHANGE_MODIFY);
         unsigned int ins_seqno = sbrec_multicast_group_row_get_seqno(mc,
             OVSDB_IDL_CHANGE_INSERT);
-        // this offset is to protect the hard coded rules below
-        ins_seqno += 4;
 
         /* if the row has a del_seqno > 0, then trying to process the
          * row isn't going to work (as it has already been freed).
          * Therefore all we can do is to pass the ins_seqno to 
          * ofctrl_remove_flow() to remove the flow */
         if (del_seqno > 0) {
-            ofctrl_remove_flow(ins_seqno);
+            ofctrl_remove_flow(ins_seqno+4);
             continue;
         }
+
+        // this offset is to protect the hard coded rules below
+        ins_seqno += 4;
 
         struct sset remote_chassis = SSET_INITIALIZER(&remote_chassis);
         struct match match;
@@ -755,11 +825,4 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
                     4, 0);
 
     ofpbuf_uninit(&ofpacts);
-    simap_destroy(&localvif_to_ofport);
-    struct chassis_tunnel *tun_next;
-    HMAP_FOR_EACH_SAFE (tun, tun_next, hmap_node, &tunnels) {
-        hmap_remove(&tunnels, &tun->hmap_node);
-        free(tun);
-    }
-    hmap_destroy(&tunnels);
 }

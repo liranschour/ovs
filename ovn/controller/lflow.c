@@ -15,6 +15,7 @@
 
 #include <config.h>
 #include "lflow.h"
+#include "physical.h"
 #include "dynamic-string.h"
 #include "ofctrl.h"
 #include "ofp-actions.h"
@@ -445,6 +446,8 @@ lflow_run(struct controller_ctx *ctx,
     if (restart_flow_processing) {
         seqno = 0;
         ovn_flow_table_clear();
+        localvif_to_ofports_clear();
+        tunnels_clear();
         restart_flow_processing = false;
     }
 

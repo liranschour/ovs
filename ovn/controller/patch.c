@@ -15,6 +15,7 @@
 
 #include <config.h>
 
+#include "lflow.h"
 #include "patch.h"
 
 #include "hash.h"
@@ -92,7 +93,7 @@ create_patch_port(struct controller_ctx *ctx,
     ports[src->n_ports] = port;
     ovsrec_bridge_verify_ports(src);
     ovsrec_bridge_set_ports(src, ports, src->n_ports + 1);
-
+    reset_flow_processing();
     free(ports);
 }
 
@@ -125,6 +126,7 @@ remove_port(struct controller_ctx *ctx,
             return;
         }
     }
+    reset_flow_processing();
 }
 
 /* Obtains external-ids:ovn-bridge-mappings from OVSDB and adds patch ports for

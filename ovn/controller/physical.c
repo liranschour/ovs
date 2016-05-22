@@ -310,7 +310,7 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             if (!binding->chassis) {
                 continue;
             }
-            if (localnet_port) {
+            if (localnet_port && localnet_port->logical_port) {
                 ofport = u16_to_ofp(simap_get(&localvif_to_ofport,
                                               localnet_port->logical_port));
                 if (!ofport) {

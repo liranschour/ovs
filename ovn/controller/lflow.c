@@ -26,6 +26,7 @@
 #include "ovn/lib/expr.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "packets.h"
+#include "physical.h"
 #include "simap.h"
 
 VLOG_DEFINE_THIS_MODULE(lflow);
@@ -34,6 +35,16 @@ VLOG_DEFINE_THIS_MODULE(lflow);
 
 /* Contains "struct expr_symbol"s for fields supported by OVN lflows. */
 static struct shash symtab;
+
+static bool full_flow_processing = false;
+static bool full_logical_flow_processing = false;
+static bool full_neighbor_flow_processing = false;
+
+void
+reset_flow_processing(void)
+{
+    full_flow_processing = true;
+}
 
 static void
 add_logical_register(struct shash *symtab, enum mf_field_id id)
@@ -193,24 +204,22 @@ is_switch(const struct sbrec_datapath_binding *ldp)
 
 }
 
-/* Adds the logical flows from the Logical_Flow table to flow tables. */
 static void
-add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
-                  const struct mcgroup_index *mcgroups,
-                  const struct hmap *local_datapaths,
-                  const struct hmap *patched_datapaths,
-                  const struct simap *ct_zones)
+consider_logical_flow(const struct lport_index *lports,
+                      const struct mcgroup_index *mcgroups,
+                      const struct sbrec_logical_flow *lflow,
+                      const struct hmap *local_datapaths,
+                      const struct hmap *patched_datapaths,
+                      const struct simap *ct_zones,
+                      uint32_t *conj_id_ofs_p,
+                      bool is_new)
 {
-    uint32_t conj_id_ofs = 1;
-
-    const struct sbrec_logical_flow *lflow;
-    SBREC_LOGICAL_FLOW_FOR_EACH (lflow, ctx->ovnsb_idl) {
         /* Determine translation of logical table IDs to physical table IDs. */
         bool ingress = !strcmp(lflow->pipeline, "ingress");
 
         const struct sbrec_datapath_binding *ldp = lflow->logical_datapath;
         if (!ldp) {
-            continue;
+            return;
         }
         if (is_switch(ldp)) {
             /* For a logical switch datapath, local_datapaths tells us if there
@@ -243,11 +252,11 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
 
             if (!get_local_datapath(local_datapaths, ldp->tunnel_key)) {
                 if (!ingress) {
-                    continue;
+                    return;
                 }
                 if (!get_patched_datapath(patched_datapaths,
                                           ldp->tunnel_key)) {
-                    continue;
+                    return;
                 }
             }
         }
@@ -293,7 +302,7 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
             VLOG_WARN_RL(&rl, "error parsing actions \"%s\": %s",
                          lflow->actions, error);
             free(error);
-            continue;
+            return;
         }
 
         /* Translate OVN match into table of OpenFlow matches. */
@@ -315,7 +324,7 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
             expr_destroy(prereqs);
             ofpbuf_uninit(&ofpacts);
             free(error);
-            continue;
+            return;
         }
 
         expr = expr_simplify(expr);
@@ -330,11 +339,11 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
             match_set_metadata(&m->match,
                                htonll(lflow->logical_datapath->tunnel_key));
             if (m->match.wc.masks.conj_id) {
-                m->match.flow.conj_id += conj_id_ofs;
+                m->match.flow.conj_id += *conj_id_ofs_p;
             }
             if (!m->n) {
                 ofctrl_add_flow(ptable, lflow->priority, &m->match, &ofpacts,
-                                &lflow->header_.uuid, true);
+                                &lflow->header_.uuid, is_new);
             } else {
                 uint64_t conj_stubs[64 / 8];
                 struct ofpbuf conj;
@@ -345,20 +354,54 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
                     struct ofpact_conjunction *dst;
 
                     dst = ofpact_put_CONJUNCTION(&conj);
-                    dst->id = src->id + conj_id_ofs;
+                    dst->id = src->id + *conj_id_ofs_p;
                     dst->clause = src->clause;
                     dst->n_clauses = src->n_clauses;
                 }
                 ofctrl_add_flow(ptable, lflow->priority, &m->match, &conj,
-                                &lflow->header_.uuid, true);
+                                &lflow->header_.uuid, is_new);
                 ofpbuf_uninit(&conj);
             }
         }
-
         /* Clean up. */
         expr_matches_destroy(&matches);
         ofpbuf_uninit(&ofpacts);
-        conj_id_ofs += n_conjs;
+        *conj_id_ofs_p += n_conjs;
+}
+
+/* Adds the logical flows from the Logical_Flow table to 'flow_table'. */
+static void
+add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
+                  const struct mcgroup_index *mcgroups,
+                  const struct hmap *local_datapaths,
+                  const struct hmap *patched_datapaths,
+                  const struct simap *ct_zones)
+{
+    uint32_t conj_id_ofs = 1;
+    const struct sbrec_logical_flow *lflow;
+
+    if (full_logical_flow_processing) {
+        SBREC_LOGICAL_FLOW_FOR_EACH (lflow, ctx->ovnsb_idl) {
+            consider_logical_flow(lports, mcgroups, lflow, local_datapaths,
+                                  patched_datapaths, ct_zones, &conj_id_ofs,
+                                  true);
+        }
+        full_logical_flow_processing = false;
+    } else {
+        SBREC_LOGICAL_FLOW_FOR_EACH_TRACKED (lflow, ctx->ovnsb_idl) {
+            bool is_deleted = sbrec_logical_flow_row_get_seqno(lflow,
+                OVSDB_IDL_CHANGE_DELETE) > 0;
+            bool is_new = sbrec_logical_flow_row_get_seqno(lflow,
+                OVSDB_IDL_CHANGE_MODIFY) == 0;
+
+            if (is_deleted) {
+                ofctrl_remove_flows(&lflow->header_.uuid);
+                continue;
+            }
+            consider_logical_flow(lports, mcgroups, lflow, local_datapaths,
+                                  patched_datapaths, ct_zones, &conj_id_ofs,
+                                  is_new);
+        }
     }
 }
 
@@ -375,6 +418,44 @@ put_load(const uint8_t *data, size_t len,
     bitwise_one(&sf->mask, sf->field->n_bytes, ofs, n_bits);
 }
 
+static void
+consider_neighbor_flow(const struct lport_index *lports,
+                       const struct sbrec_mac_binding *b,
+                       struct ofpbuf *ofpacts_p,
+                       struct match *match_p,
+                       bool is_new)
+{
+    const struct sbrec_port_binding *pb
+        = lport_lookup_by_name(lports, b->logical_port);
+    if (!pb) {
+        return;
+    }
+
+    struct eth_addr mac;
+    if (!eth_addr_from_string(b->mac, &mac)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+        VLOG_WARN_RL(&rl, "bad 'mac' %s", b->mac);
+        return;
+    }
+
+    ovs_be32 ip;
+    if (!ip_parse(b->ip, &ip)) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+        VLOG_WARN_RL(&rl, "bad 'ip' %s", b->ip);
+        return;
+    }
+
+    match_set_metadata(match_p, htonll(pb->datapath->tunnel_key));
+    match_set_reg(match_p, MFF_LOG_OUTPORT - MFF_REG0, pb->tunnel_key);
+    match_set_reg(match_p, 0, ntohl(ip));
+
+    ofpbuf_clear(ofpacts_p);
+    put_load(mac.ea, sizeof mac.ea, MFF_ETH_DST, 0, 48, ofpacts_p);
+
+    ofctrl_add_flow(OFTABLE_MAC_BINDING, 100, match_p, ofpacts_p,
+                    &b->header_.uuid, is_new);
+}
+
 /* Adds an OpenFlow flow to flow tables for each MAC binding in the OVN
  * southbound database, using 'lports' to resolve logical port names to
  * numbers. */
@@ -388,36 +469,24 @@ add_neighbor_flows(struct controller_ctx *ctx,
     ofpbuf_init(&ofpacts, 0);
 
     const struct sbrec_mac_binding *b;
-    SBREC_MAC_BINDING_FOR_EACH (b, ctx->ovnsb_idl) {
-        const struct sbrec_port_binding *pb
-            = lport_lookup_by_name(lports, b->logical_port);
-        if (!pb) {
-            continue;
+    if (full_neighbor_flow_processing) {
+        SBREC_MAC_BINDING_FOR_EACH (b, ctx->ovnsb_idl) {
+          consider_neighbor_flow(lports, b, &ofpacts, &match, true);
         }
+        full_neighbor_flow_processing = false;
+    } else {
+        SBREC_MAC_BINDING_FOR_EACH_TRACKED (b, ctx->ovnsb_idl) {
+            bool is_deleted = sbrec_mac_binding_row_get_seqno(b,
+                OVSDB_IDL_CHANGE_DELETE) > 0;
+            bool is_new = sbrec_mac_binding_row_get_seqno(b,
+                OVSDB_IDL_CHANGE_MODIFY) == 0;
 
-        struct eth_addr mac;
-        if (!eth_addr_from_string(b->mac, &mac)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "bad 'mac' %s", b->mac);
-            continue;
+            if (is_deleted) {
+                ofctrl_remove_flows(&b->header_.uuid);
+                continue;
+            }
+            consider_neighbor_flow(lports, b, &ofpacts, &match, is_new);
         }
-
-        ovs_be32 ip;
-        if (!ip_parse(b->ip, &ip)) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "bad 'ip' %s", b->ip);
-            continue;
-        }
-
-        match_set_metadata(&match, htonll(pb->datapath->tunnel_key));
-        match_set_reg(&match, MFF_LOG_OUTPORT - MFF_REG0, pb->tunnel_key);
-        match_set_reg(&match, 0, ntohl(ip));
-
-        ofpbuf_clear(&ofpacts);
-        put_load(mac.ea, sizeof mac.ea, MFF_ETH_DST, 0, 48, &ofpacts);
-
-        ofctrl_add_flow(OFTABLE_MAC_BINDING, 100, &match, &ofpacts,
-                        &b->header_.uuid, true);
     }
     ofpbuf_uninit(&ofpacts);
 }
@@ -431,6 +500,14 @@ lflow_run(struct controller_ctx *ctx, const struct lport_index *lports,
           const struct hmap *patched_datapaths,
           const struct simap *ct_zones)
 {
+    if (full_flow_processing) {
+        ovn_flow_table_clear();
+        localvif_to_ofports_clear();
+        tunnels_clear();
+        full_logical_flow_processing = true;
+        full_neighbor_flow_processing = true;
+        full_flow_processing = false;
+    }
     add_logical_flows(ctx, lports, mcgroups, local_datapaths,
                       patched_datapaths, ct_zones);
     add_neighbor_flows(ctx, lports);

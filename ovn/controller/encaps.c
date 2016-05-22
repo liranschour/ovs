@@ -233,6 +233,7 @@ tunnel_add(const struct sbrec_chassis *chassis_rec,
     sset_add(&tc.port_names, port_name);
     free(port_name);
     free(ports);
+    reset_flow_processing();
     reset_binding_processing();
     process_full_encaps = true;
 }
@@ -417,6 +418,7 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
                     hmap_remove(&tc.tunnel_hmap_by_uuid,
                                 &port_hash->uuid_node);
                     free(port_hash);
+                    reset_flow_processing();
                     reset_binding_processing();
                 }
                 continue;

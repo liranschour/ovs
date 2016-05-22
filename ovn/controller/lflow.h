@@ -65,5 +65,8 @@ void lflow_run(struct controller_ctx *, const struct lport_index *,
                const struct hmap *patched_datapaths,
                const struct simap *ct_zones);
 void lflow_destroy(void);
+void reset_flow_processing(void);
+
+void reset_flow_processing(void);
 
 #endif /* ovn/lflow.h */

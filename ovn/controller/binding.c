@@ -15,6 +15,8 @@
 
 #include <config.h>
 #include "binding.h"
+#include "lflow.h"
+#include "lport.h"
 
 #include "lib/bitmap.h"
 #include "lib/hmap.h"
@@ -163,6 +165,7 @@ remove_local_datapath(struct hmap *local_datapaths, struct local_datapath *ld)
     hmap_remove(local_datapaths, &ld->hmap_node);
     hmap_remove(&local_datapaths_by_uuid, &ld->uuid_hmap_node);
     free(ld);
+    reset_flow_processing();
 }
 
 static void
@@ -201,6 +204,7 @@ add_local_datapath(struct hmap *local_datapaths,
                 binding_rec->datapath->tunnel_key);
     hmap_insert(&local_datapaths_by_uuid, &ld->uuid_hmap_node,
                 uuid_hash(uuid));
+    reset_flow_processing();
 }
 
 static void
@@ -311,6 +315,7 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
             ;
         }
         hmap_destroy(&keep_local_datapath_by_uuid);
+        flag_rebuild_lport_mcast_indexes();
         process_full_binding = false;
     } else {
         SBREC_PORT_BINDING_FOR_EACH_TRACKED(binding_rec, ctx->ovnsb_idl) {

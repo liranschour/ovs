@@ -387,7 +387,6 @@ main(int argc, char *argv[])
 
             pinctrl_run(&ctx, &lports, br_int, chassis_id, &local_datapaths);
 
-            ovn_flow_table_clear();
             lflow_run(&ctx, &lports, &mcgroups, &local_datapaths,
                       &patched_datapaths, &ct_zones);
             if (chassis_id) {

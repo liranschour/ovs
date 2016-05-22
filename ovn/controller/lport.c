@@ -75,6 +75,7 @@ lport_index_clear(struct lport_index *lports)
         hmap_remove(&lports->by_uuid, &port->uuid_node);
         free(port);
     }
+    reset_flow_processing();
 }
 
 static void
@@ -94,6 +95,7 @@ consider_lport_index(struct lport_index *lports,
                 uuid_hash(&pb->header_.uuid));
     p->uuid = &pb->header_.uuid;
     p->pb = pb;
+    reset_flow_processing();
 }
 
 void
@@ -113,6 +115,7 @@ lport_index_fill(struct lport_index *lports, struct ovsdb_idl *ovnsb_idl)
 
             if (is_delete) {
                 lport_index_remove(lports, &pb->header_.uuid);
+                reset_flow_processing();
                 continue;
             }
             consider_lport_index(lports, pb);
@@ -199,6 +202,7 @@ mcgroup_index_remove(struct mcgroup_index *mcgroups, const struct uuid *uuid)
                     (struct hmap_node *) &mcgroup->uuid_node);
         free((void *) mcgroup);
     }
+    reset_flow_processing();
 }
 
 void
@@ -228,6 +232,7 @@ consider_mcgroup_index(struct mcgroup_index *mcgroups,
                 uuid_hash(&mg->header_.uuid));
     m->uuid = &mg->header_.uuid;
     m->mg = mg;
+    reset_flow_processing();
 }
 
 void
@@ -247,6 +252,7 @@ mcgroup_index_fill(struct mcgroup_index *mcgroups, struct ovsdb_idl *ovnsb_idl)
 
             if (is_delete) {
                 mcgroup_index_remove(mcgroups, &mg->header_.uuid);
+                reset_flow_processing();
                 continue;
             }
             consider_mcgroup_index(mcgroups, mg);

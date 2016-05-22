@@ -387,16 +387,15 @@ main(int argc, char *argv[])
 
             pinctrl_run(&ctx, &lports, br_int, chassis_id, &local_datapaths);
 
-            struct hmap flow_table = HMAP_INITIALIZER(&flow_table);
+            ovn_flow_table_clear();
             lflow_run(&ctx, &lports, &mcgroups, &local_datapaths,
-                      &patched_datapaths, &ct_zones, &flow_table);
+                      &patched_datapaths, &ct_zones);
             if (chassis_id) {
                 physical_run(&ctx, mff_ovn_geneve,
-                             br_int, chassis_id, &ct_zones, &flow_table,
+                             br_int, chassis_id, &ct_zones,
                              &local_datapaths, &patched_datapaths);
             }
-            ofctrl_put(&flow_table);
-            hmap_destroy(&flow_table);
+            ofctrl_put();
         }
 
         unixctl_server_run(unixctl);

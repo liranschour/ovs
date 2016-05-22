@@ -193,13 +193,13 @@ is_switch(const struct sbrec_datapath_binding *ldp)
 
 }
 
-/* Adds the logical flows from the Logical_Flow table to 'flow_table'. */
+/* Adds the logical flows from the Logical_Flow table to flow tables. */
 static void
 add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
                   const struct mcgroup_index *mcgroups,
                   const struct hmap *local_datapaths,
                   const struct hmap *patched_datapaths,
-                  const struct simap *ct_zones, struct hmap *flow_table)
+                  const struct simap *ct_zones)
 {
     uint32_t conj_id_ofs = 1;
 
@@ -333,8 +333,8 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
                 m->match.flow.conj_id += conj_id_ofs;
             }
             if (!m->n) {
-                ofctrl_add_flow(flow_table, ptable, lflow->priority,
-                                &m->match, &ofpacts);
+                ofctrl_add_flow(ptable, lflow->priority, &m->match, &ofpacts,
+                                &lflow->header_.uuid, true);
             } else {
                 uint64_t conj_stubs[64 / 8];
                 struct ofpbuf conj;
@@ -349,8 +349,8 @@ add_logical_flows(struct controller_ctx *ctx, const struct lport_index *lports,
                     dst->clause = src->clause;
                     dst->n_clauses = src->n_clauses;
                 }
-                ofctrl_add_flow(flow_table, ptable, lflow->priority,
-                                &m->match, &conj);
+                ofctrl_add_flow(ptable, lflow->priority, &m->match, &conj,
+                                &lflow->header_.uuid, true);
                 ofpbuf_uninit(&conj);
             }
         }
@@ -375,12 +375,12 @@ put_load(const uint8_t *data, size_t len,
     bitwise_one(&sf->mask, sf->field->n_bytes, ofs, n_bits);
 }
 
-/* Adds an OpenFlow flow to 'flow_table' for each MAC binding in the OVN
+/* Adds an OpenFlow flow to flow tables for each MAC binding in the OVN
  * southbound database, using 'lports' to resolve logical port names to
  * numbers. */
 static void
 add_neighbor_flows(struct controller_ctx *ctx,
-                   const struct lport_index *lports, struct hmap *flow_table)
+                   const struct lport_index *lports)
 {
     struct ofpbuf ofpacts;
     struct match match;
@@ -416,8 +416,8 @@ add_neighbor_flows(struct controller_ctx *ctx,
         ofpbuf_clear(&ofpacts);
         put_load(mac.ea, sizeof mac.ea, MFF_ETH_DST, 0, 48, &ofpacts);
 
-        ofctrl_add_flow(flow_table, OFTABLE_MAC_BINDING, 100,
-                        &match, &ofpacts);
+        ofctrl_add_flow(OFTABLE_MAC_BINDING, 100, &match, &ofpacts,
+                        &b->header_.uuid, true);
     }
     ofpbuf_uninit(&ofpacts);
 }
@@ -429,11 +429,11 @@ lflow_run(struct controller_ctx *ctx, const struct lport_index *lports,
           const struct mcgroup_index *mcgroups,
           const struct hmap *local_datapaths,
           const struct hmap *patched_datapaths,
-          const struct simap *ct_zones, struct hmap *flow_table)
+          const struct simap *ct_zones)
 {
     add_logical_flows(ctx, lports, mcgroups, local_datapaths,
-                      patched_datapaths, ct_zones, flow_table);
-    add_neighbor_flows(ctx, lports, flow_table);
+                      patched_datapaths, ct_zones);
+    add_neighbor_flows(ctx, lports);
 }
 
 void

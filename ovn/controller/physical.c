@@ -50,6 +50,9 @@ physical_register_ovs_idl(struct ovsdb_idl *ovs_idl)
     ovsdb_idl_add_column(ovs_idl, &ovsrec_interface_col_external_ids);
 }
 
+static struct uuid *hc_uuid = NULL; // uuid to identify OF flows not associated
+                                    // with ovsdb rows.
+
 /* Maps from a chassis to the OpenFlow port number of the tunnel that can be
  * used to reach that chassis. */
 struct chassis_tunnel {
@@ -148,11 +151,15 @@ get_localnet_port(struct hmap *local_datapaths, int64_t tunnel_key)
 void
 physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
              const struct ovsrec_bridge *br_int, const char *this_chassis_id,
-             const struct simap *ct_zones, struct hmap *flow_table,
+             const struct simap *ct_zones,
              struct hmap *local_datapaths, struct hmap *patched_datapaths)
 {
     struct simap localvif_to_ofport = SIMAP_INITIALIZER(&localvif_to_ofport);
     struct hmap tunnels = HMAP_INITIALIZER(&tunnels);
+    if (!hc_uuid) {
+        hc_uuid = xmalloc(sizeof(struct uuid));
+        uuid_generate(hc_uuid);
+    }
 
     for (int i = 0; i < br_int->n_ports; i++) {
         const struct ovsrec_port *port_rec = br_int->ports[i];
@@ -373,8 +380,9 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
 
             /* Resubmit to first logical ingress pipeline table. */
             put_resubmit(OFTABLE_LOG_INGRESS_PIPELINE, &ofpacts);
-            ofctrl_add_flow(flow_table, OFTABLE_PHY_TO_LOG,
-                            tag ? 150 : 100, &match, &ofpacts);
+            ofctrl_add_flow(OFTABLE_PHY_TO_LOG,
+                            tag ? 150 : 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
 
             if (!tag && !strcmp(binding->type, "localnet")) {
                 /* Add a second flow for frames that lack any 802.1Q
@@ -382,7 +390,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
                  * action. */
                 ofpbuf_pull(&ofpacts, ofpacts_orig_size);
                 match_set_dl_tci_masked(&match, 0, htons(VLAN_CFI));
-                ofctrl_add_flow(flow_table, 0, 100, &match, &ofpacts);
+                ofctrl_add_flow(0, 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
             }
 
             /* Table 33, priority 100.
@@ -406,8 +415,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
 
             /* Resubmit to table 34. */
             put_resubmit(OFTABLE_DROP_LOOPBACK, &ofpacts);
-            ofctrl_add_flow(flow_table, OFTABLE_LOCAL_OUTPUT, 100, &match,
-                            &ofpacts);
+            ofctrl_add_flow(OFTABLE_LOCAL_OUTPUT, 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
 
             /* Table 34, Priority 100.
              * =======================
@@ -418,8 +427,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             match_set_metadata(&match, htonll(dp_key));
             match_set_reg(&match, MFF_LOG_INPORT - MFF_REG0, port_key);
             match_set_reg(&match, MFF_LOG_OUTPORT - MFF_REG0, port_key);
-            ofctrl_add_flow(flow_table, OFTABLE_DROP_LOOPBACK, 100,
-                            &match, &ofpacts);
+            ofctrl_add_flow(OFTABLE_DROP_LOOPBACK, 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
 
             /* Table 64, Priority 100.
              * =======================
@@ -453,8 +462,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
                 ofpact_put_STRIP_VLAN(&ofpacts);
                 put_stack(MFF_IN_PORT, ofpact_put_STACK_POP(&ofpacts));
             }
-            ofctrl_add_flow(flow_table, OFTABLE_LOG_TO_PHY, 100,
-                            &match, &ofpacts);
+            ofctrl_add_flow(OFTABLE_LOG_TO_PHY, 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
         } else if (!tun) {
             /* Remote port connected by localnet port */
             /* Table 33, priority 100.
@@ -476,8 +485,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
 
             /* Resubmit to table 33. */
             put_resubmit(OFTABLE_LOCAL_OUTPUT, &ofpacts);
-            ofctrl_add_flow(flow_table, OFTABLE_LOCAL_OUTPUT, 100, &match,
-                            &ofpacts);
+            ofctrl_add_flow(OFTABLE_LOCAL_OUTPUT, 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
         } else {
             /* Remote port connected by tunnel */
             /* Table 32, priority 100.
@@ -500,8 +509,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
 
             /* Output to tunnel. */
             ofpact_put_OUTPUT(&ofpacts)->port = ofport;
-            ofctrl_add_flow(flow_table, OFTABLE_REMOTE_OUTPUT, 100,
-                            &match, &ofpacts);
+            ofctrl_add_flow(OFTABLE_REMOTE_OUTPUT, 100, &match, &ofpacts,
+                            &binding->header_.uuid, true);
         }
     }
 
@@ -576,8 +585,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
              * group as the logical output port. */
             put_load(mc->tunnel_key, MFF_LOG_OUTPORT, 0, 32, &ofpacts);
 
-            ofctrl_add_flow(flow_table, OFTABLE_LOCAL_OUTPUT, 100,
-                            &match, &ofpacts);
+            ofctrl_add_flow(OFTABLE_LOCAL_OUTPUT, 100, &match, &ofpacts,
+                            &mc->header_.uuid, true);
         }
 
         /* Table 32, priority 100.
@@ -614,8 +623,9 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
                 if (local_ports) {
                     put_resubmit(OFTABLE_LOCAL_OUTPUT, &remote_ofpacts);
                 }
-                ofctrl_add_flow(flow_table, OFTABLE_REMOTE_OUTPUT, 100,
-                                &match, &remote_ofpacts);
+                ofctrl_add_flow(OFTABLE_REMOTE_OUTPUT, 100,
+                                &match, &remote_ofpacts,
+                                &mc->header_.uuid, true);
             }
         }
         sset_destroy(&remote_chassis);
@@ -658,7 +668,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
 
         put_resubmit(OFTABLE_LOCAL_OUTPUT, &ofpacts);
 
-        ofctrl_add_flow(flow_table, OFTABLE_PHY_TO_LOG, 100, &match, &ofpacts);
+        ofctrl_add_flow(OFTABLE_PHY_TO_LOG, 100, &match, &ofpacts,
+                        hc_uuid, true);
     }
 
     /* Add flows for VXLAN encapsulations.  Due to the limited amount of
@@ -691,8 +702,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             put_load(binding->tunnel_key, MFF_LOG_INPORT, 0, 15, &ofpacts);
             put_resubmit(OFTABLE_LOG_INGRESS_PIPELINE, &ofpacts);
 
-            ofctrl_add_flow(flow_table, OFTABLE_PHY_TO_LOG, 100, &match,
-                    &ofpacts);
+            ofctrl_add_flow(OFTABLE_PHY_TO_LOG, 100, &match, &ofpacts,
+                            hc_uuid, true);
         }
     }
 
@@ -705,7 +716,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
     match_init_catchall(&match);
     ofpbuf_clear(&ofpacts);
     put_resubmit(OFTABLE_LOCAL_OUTPUT, &ofpacts);
-    ofctrl_add_flow(flow_table, OFTABLE_REMOTE_OUTPUT, 0, &match, &ofpacts);
+    ofctrl_add_flow(OFTABLE_REMOTE_OUTPUT, 0, &match, &ofpacts,
+                    hc_uuid, true);
 
     /* Table 34, Priority 0.
      * =======================
@@ -719,7 +731,8 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
     MFF_LOG_REGS;
 #undef MFF_LOG_REGS
     put_resubmit(OFTABLE_LOG_EGRESS_PIPELINE, &ofpacts);
-    ofctrl_add_flow(flow_table, OFTABLE_DROP_LOOPBACK, 0, &match, &ofpacts);
+    ofctrl_add_flow(OFTABLE_DROP_LOOPBACK, 0, &match, &ofpacts,
+                    hc_uuid, true);
 
     ofpbuf_uninit(&ofpacts);
     simap_destroy(&localvif_to_ofport);

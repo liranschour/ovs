@@ -257,6 +257,9 @@ get_ovnsb_remote_probe_interval(struct ovsdb_idl *ovs_idl, int *value)
 static struct hmap local_datapaths = HMAP_INITIALIZER(&local_datapaths);
 static struct hmap patched_datapaths = HMAP_INITIALIZER(&patched_datapaths);
 
+static struct lport_index lports;
+static struct mcgroup_index mcgroups;
+
 int
 main(int argc, char *argv[])
 {
@@ -286,6 +289,9 @@ main(int argc, char *argv[])
     ofctrl_init();
     pinctrl_init();
     lflow_init();
+
+    lport_index_init(&lports);
+    mcgroup_index_init(&mcgroups);
 
     /* Connect to OVS OVSDB instance.  We do not monitor all tables by
      * default, so modules must register their interest explicitly.  */
@@ -348,6 +354,8 @@ main(int argc, char *argv[])
             ovsdb_idl_set_remote(ovnsb_idl_loop.idl, ovnsb_remote, true);
             hmap_clear(&local_datapaths);
             hmap_clear(&patched_datapaths);
+            lport_index_clear(&lports);
+            mcgroup_index_clear(&mcgroups);
         } else {
             free(new_ovnsb_remote);
         }
@@ -372,10 +380,8 @@ main(int argc, char *argv[])
         if (br_int) {
             patch_run(&ctx, br_int, &local_datapaths, &patched_datapaths);
 
-            struct lport_index lports;
-            struct mcgroup_index mcgroups;
-            lport_index_init(&lports, ctx.ovnsb_idl);
-            mcgroup_index_init(&mcgroups, ctx.ovnsb_idl);
+            lport_index_fill(&lports, ctx.ovnsb_idl);
+            mcgroup_index_fill(&mcgroups, ctx.ovnsb_idl);
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
@@ -391,8 +397,6 @@ main(int argc, char *argv[])
             }
             ofctrl_put(&flow_table);
             hmap_destroy(&flow_table);
-            mcgroup_index_destroy(&mcgroups);
-            lport_index_destroy(&lports);
         }
 
         unixctl_server_run(unixctl);

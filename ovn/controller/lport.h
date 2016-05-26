@@ -22,6 +22,7 @@
 
 struct ovsdb_idl;
 struct sbrec_datapath_binding;
+struct controller_ctx;
 
 void flag_rebuild_lport_mcast_indexes(void);
 
@@ -39,7 +40,7 @@ struct lport_index {
 };
 
 void lport_index_init(struct lport_index *);
-void lport_index_fill(struct lport_index *, struct ovsdb_idl *);
+void lport_index_fill(struct lport_index *, struct controller_ctx *);
 void lport_index_remove(struct lport_index *, const struct uuid *);
 void lport_index_clear(struct lport_index *);
 void lport_index_destroy(struct lport_index *);
@@ -69,7 +70,7 @@ struct mcgroup_index {
 };
 
 void mcgroup_index_init(struct mcgroup_index *);
-void mcgroup_index_fill(struct mcgroup_index *, struct ovsdb_idl *);
+void mcgroup_index_fill(struct mcgroup_index *, struct controller_ctx *);
 void mcgroup_index_remove(struct mcgroup_index *, const struct uuid *);
 void mcgroup_index_clear(struct mcgroup_index *);
 void mcgroup_index_destroy(struct mcgroup_index *);

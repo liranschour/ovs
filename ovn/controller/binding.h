@@ -24,12 +24,14 @@ struct hmap;
 struct ovsdb_idl;
 struct ovsrec_bridge;
 struct simap;
+struct lport_index;
 
 void binding_register_ovs_idl(struct ovsdb_idl *);
 void reset_binding_processing(void);
 void binding_run(struct controller_ctx *, const struct ovsrec_bridge *br_int,
                  const char *chassis_id, struct simap *ct_zones,
-                 unsigned long *ct_zone_bitmap, struct hmap *local_datapaths);
+                 unsigned long *ct_zone_bitmap, struct hmap *local_datapaths,
+                 const struct lport_index *lport_indexes);
 bool binding_cleanup(struct controller_ctx *, const char *chassis_id);
 
 #endif /* ovn/binding.h */

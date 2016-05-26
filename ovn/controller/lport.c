@@ -20,6 +20,7 @@
 #include "lflow.h"
 #include "openvswitch/vlog.h"
 #include "ovn/lib/ovn-sb-idl.h"
+#include "ovn-controller.h"
 
 VLOG_DEFINE_THIS_MODULE(lport);
 
@@ -34,6 +35,70 @@ struct lport {
 
 static bool full_lport_rebuild = false;
 static bool full_mc_rebuild = false;
+
+/* Logical datapath that has been added to conditions */
+struct logical_datapath {
+    struct hmap_node hmap_node; /* Indexed on 'uuid'. */
+    struct uuid uuid;           /* UUID from Datapath_Binding row. */
+    uint32_t tunnel_key;        /* 'tunnel_key' from Datapath_Binding row. */
+    size_t n_ports;
+};
+
+/* Contains "struct logical_datapath"s. */
+static struct hmap logical_datapaths = HMAP_INITIALIZER(&logical_datapaths);
+
+/* Finds and returns the logical_datapath for 'binding', or NULL if no such
+ * logical_datapath exists. */
+static struct logical_datapath *
+ldp_lookup(const struct sbrec_datapath_binding *binding)
+{
+    struct logical_datapath *ldp;
+    HMAP_FOR_EACH_IN_BUCKET (ldp, hmap_node, uuid_hash(&binding->header_.uuid),
+                             &logical_datapaths) {
+        if (uuid_equals(&ldp->uuid, &binding->header_.uuid)) {
+            return ldp;
+        }
+    }
+    return NULL;
+}
+
+/* Creates a new logical_datapath for the given 'binding'. */
+static struct logical_datapath *
+ldp_create(const struct sbrec_datapath_binding *binding)
+{
+    struct logical_datapath *ldp;
+
+    ldp = xmalloc(sizeof *ldp);
+    hmap_insert(&logical_datapaths, &ldp->hmap_node,
+                uuid_hash(&binding->header_.uuid));
+    ldp->uuid = binding->header_.uuid;
+    ldp->tunnel_key = binding->tunnel_key;
+    ldp->n_ports = 0;
+    return ldp;
+}
+
+static struct logical_datapath *
+ldp_lookup_or_create(struct controller_ctx *ctx,
+                     const struct sbrec_datapath_binding *binding)
+{
+    struct logical_datapath *ldp = ldp_lookup(binding);
+
+    if (!ldp) {
+        ldp = ldp_create(binding);
+        VLOG_INFO("add logical datapath "UUID_FMT, UUID_ARGS(&ldp->uuid));
+        sbrec_port_binding_add_clause_datapath(ctx->binding_cond,
+                                               OVSDB_IDL_F_EQ, binding);
+        sbrec_logical_flow_add_clause_logical_datapath(ctx->lflow_cond,
+                                                       OVSDB_IDL_F_EQ, binding);
+        sbrec_multicast_group_add_clause_datapath(ctx->mgroup_cond,
+                                                  OVSDB_IDL_F_EQ, binding);
+        ctx->binding_cond_updated = true;
+        ctx->lflow_cond_updated = true;
+        ctx->mgroup_cond_updated = true;
+    }
+    ldp->n_ports++;
+    return ldp;
+}
 
 void
 flag_rebuild_lport_mcast_indexes(void)
@@ -99,17 +164,19 @@ consider_lport_index(struct lport_index *lports,
 }
 
 void
-lport_index_fill(struct lport_index *lports, struct ovsdb_idl *ovnsb_idl)
+lport_index_fill(struct lport_index *lports, struct controller_ctx *ctx)
 {
     const struct sbrec_port_binding *pb;
+
     if (full_lport_rebuild) {
         lport_index_clear(lports);
-        SBREC_PORT_BINDING_FOR_EACH (pb, ovnsb_idl) {
+        SBREC_PORT_BINDING_FOR_EACH (pb, ctx->ovnsb_idl) {
+            ldp_lookup_or_create(ctx, pb->datapath);
             consider_lport_index(lports, pb);
         }
         full_lport_rebuild = false;
     } else {
-        SBREC_PORT_BINDING_FOR_EACH_TRACKED (pb, ovnsb_idl) {
+        SBREC_PORT_BINDING_FOR_EACH_TRACKED (pb, ctx->ovnsb_idl) {
             bool is_delete = sbrec_port_binding_row_get_seqno(pb,
                 OVSDB_IDL_CHANGE_DELETE) > 0;
 
@@ -118,6 +185,7 @@ lport_index_fill(struct lport_index *lports, struct ovsdb_idl *ovnsb_idl)
                 reset_flow_processing();
                 continue;
             }
+            ldp_lookup_or_create(ctx, pb->datapath);
             consider_lport_index(lports, pb);
         }
     }
@@ -236,17 +304,18 @@ consider_mcgroup_index(struct mcgroup_index *mcgroups,
 }
 
 void
-mcgroup_index_fill(struct mcgroup_index *mcgroups, struct ovsdb_idl *ovnsb_idl)
+mcgroup_index_fill(struct mcgroup_index *mcgroups, struct controller_ctx *ctx)
 {
     const struct sbrec_multicast_group *mg;
     if (full_mc_rebuild) {
         mcgroup_index_clear(mcgroups);
-        SBREC_MULTICAST_GROUP_FOR_EACH (mg, ovnsb_idl) {
+        SBREC_MULTICAST_GROUP_FOR_EACH (mg, ctx->ovnsb_idl) {
+            ldp_lookup_or_create(ctx, mg->datapath);
             consider_mcgroup_index(mcgroups, mg);
         }
         full_mc_rebuild = false;
     } else {
-        SBREC_MULTICAST_GROUP_FOR_EACH_TRACKED (mg, ovnsb_idl) {
+        SBREC_MULTICAST_GROUP_FOR_EACH_TRACKED (mg, ctx->ovnsb_idl) {
             bool is_delete = sbrec_multicast_group_row_get_seqno(mg,
                 OVSDB_IDL_CHANGE_DELETE) > 0;
 
@@ -255,6 +324,7 @@ mcgroup_index_fill(struct mcgroup_index *mcgroups, struct ovsdb_idl *ovnsb_idl)
                 reset_flow_processing();
                 continue;
             }
+            ldp_lookup_or_create(ctx, mg->datapath);
             consider_mcgroup_index(mcgroups, mg);
         }
     }

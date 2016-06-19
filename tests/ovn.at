@@ -1356,6 +1356,7 @@ sim_add hv_gw
 as hv_gw
 ovs-vsctl add-br br-phys
 ovn_attach n1 br-phys 192.168.0.3
+ovs-vsctl add-port br-int viflp-gw -- set Interface viflp-gw external-ids:iface-id=lp-gw
 ovs-vsctl add-br br-phys2
 net_attach n2 br-phys2
 ovs-vsctl set open . external_ids:ovn-bridge-mappings="physnet1:br-phys2"

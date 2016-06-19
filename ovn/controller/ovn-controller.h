@@ -40,6 +40,7 @@ struct local_datapath {
     struct hmap_node hmap_node;
     struct hmap_node uuid_hmap_node;
     struct uuid uuid;
+    int64_t tunnel_key;
     char *logical_port;
     const struct sbrec_port_binding *localnet_port;
 };

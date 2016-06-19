@@ -24,6 +24,8 @@
 #include "openvswitch/vlog.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "ovn-controller.h"
+#include "lport.h"
+#include "filter.h"
 
 VLOG_DEFINE_THIS_MODULE(binding);
 
@@ -60,7 +62,9 @@ binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 }
 
 static bool
-get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports)
+get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports,
+                    struct lport_index *lports_index,
+                    struct controller_ctx *ctx)
 {
     int i;
     bool changed = false;
@@ -87,6 +91,9 @@ get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports)
                 continue;
             }
             shash_add(&local_ports, iface_id, iface_rec);
+            if (!lport_lookup_by_name(lports_index, iface_id)) {
+                filter_lport(ctx, iface_id);
+            }
             if (!shash_find(lports, iface_id)) {
                 shash_add(lports, iface_id, iface_rec);
                 changed = true;
@@ -159,8 +166,8 @@ remove_local_datapath_by_binding(struct hmap *local_datapaths,
 
 static void
 add_local_datapath(struct hmap *local_datapaths,
-        const struct sbrec_port_binding *binding_rec,
-        const struct uuid *uuid)
+                   const struct sbrec_port_binding *binding_rec,
+                   const struct uuid *uuid, struct controller_ctx *ctx)
 {
     if (get_local_datapath(local_datapaths,
                            binding_rec->datapath->tunnel_key)) {
@@ -174,6 +181,7 @@ add_local_datapath(struct hmap *local_datapaths,
                 binding_rec->datapath->tunnel_key);
     hmap_insert(&local_datapaths_by_uuid, &ld->uuid_hmap_node,
                 uuid_hash(uuid));
+    filter_datapath(ctx, binding_rec);
 }
 
 static void
@@ -189,6 +197,7 @@ update_qos(const struct ovsrec_interface *iface_rec,
 
 static void
 consider_local_datapath(struct controller_ctx *ctx, struct shash *lports,
+                        struct lport_index *lports_index,
                         const struct sbrec_chassis *chassis_rec,
                         const struct sbrec_port_binding *binding_rec,
                         struct hmap *local_datapaths)
@@ -203,7 +212,7 @@ consider_local_datapath(struct controller_ctx *ctx, struct shash *lports,
             sset_add(&all_lports, binding_rec->logical_port);
         }
         add_local_datapath(local_datapaths, binding_rec,
-                           &binding_rec->header_.uuid);
+                           &binding_rec->header_.uuid, ctx);
         if (iface_rec && ctx->ovs_idl_txn) {
             update_qos(iface_rec, binding_rec);
         }
@@ -244,7 +253,7 @@ consider_local_datapath(struct controller_ctx *ctx, struct shash *lports,
             sbrec_port_binding_set_chassis(binding_rec, chassis_rec);
             sset_add(&all_lports, binding_rec->logical_port);
             add_local_datapath(local_datapaths, binding_rec,
-                               &binding_rec->header_.uuid);
+                               &binding_rec->header_.uuid, ctx);
         }
     } else if (chassis_rec && binding_rec->chassis == chassis_rec
                && strcmp(binding_rec->type, "gateway")) {
@@ -261,6 +270,12 @@ consider_local_datapath(struct controller_ctx *ctx, struct shash *lports,
          * a patch port for each one. */
         sset_add(&all_lports, binding_rec->logical_port);
     }
+    const char *peer = smap_get(&binding_rec->options, "peer");
+    if (peer) {
+        if (!lport_lookup_by_name(lports_index, peer)) {
+            filter_lport(ctx, peer);
+        }
+    }
 }
 
 /* We persist lports because we need to know when it changes to
@@ -269,7 +284,8 @@ static struct shash lports = SHASH_INITIALIZER(&lports);
 
 void
 binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
-            const char *chassis_id, struct hmap *local_datapaths)
+            const char *chassis_id, struct lport_index *lports_index,
+            struct hmap *local_datapaths)
 {
     const struct sbrec_chassis *chassis_rec;
     const struct sbrec_port_binding *binding_rec;
@@ -280,7 +296,8 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
     }
 
     if (br_int) {
-        if (ctx->ovnsb_idl_txn && get_local_iface_ids(br_int, &lports)) {
+        if (ctx->ovnsb_idl_txn && get_local_iface_ids(br_int, &lports,
+                                                      lports_index, ctx)) {
             process_full_binding = true;
         }
     } else {
@@ -296,8 +313,8 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
         struct hmap keep_local_datapath_by_uuid =
             HMAP_INITIALIZER(&keep_local_datapath_by_uuid);
         SBREC_PORT_BINDING_FOR_EACH(binding_rec, ctx->ovnsb_idl) {
-            consider_local_datapath(ctx, &lports, chassis_rec, binding_rec,
-                                    local_datapaths);
+            consider_local_datapath(ctx, &lports, lports_index, chassis_rec,
+                                    binding_rec, local_datapaths);
             struct local_datapath *ld = xzalloc(sizeof *ld);
             memcpy(&ld->uuid, &binding_rec->header_.uuid, sizeof ld->uuid);
             hmap_insert(&keep_local_datapath_by_uuid, &ld->uuid_hmap_node,
@@ -317,7 +334,8 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
             if (sbrec_port_binding_is_deleted(binding_rec)) {
                 remove_local_datapath_by_binding(local_datapaths, binding_rec);
             } else {
-                consider_local_datapath(ctx, &lports, chassis_rec, binding_rec,
+                consider_local_datapath(ctx, &lports, lports_index,
+                                        chassis_rec, binding_rec,
                                         local_datapaths);
             }
         }

@@ -13,25 +13,21 @@
  * limitations under the License.
  */
 
-
-#ifndef OVN_BINDING_H
-#define OVN_BINDING_H 1
-
-#include <stdbool.h>
+#ifndef OVN_FILTER_H
+#define OVN_FILTER_H 1
 
 struct controller_ctx;
-struct hmap;
 struct ovsdb_idl;
-struct ovsrec_bridge;
-struct simap;
-struct sset;
+struct sbrec_port_binding;
 struct lport_index;
 
-void binding_register_ovs_idl(struct ovsdb_idl *);
-void binding_reset_processing(void);
-void binding_run(struct controller_ctx *, const struct ovsrec_bridge *br_int,
-                 const char *chassis_id, struct lport_index *lports_index,
-                 struct hmap *local_datapaths);
-bool binding_cleanup(struct controller_ctx *, const char *chassis_id);
+void filter_init(struct ovsdb_idl *idl);
+void filter_clear(struct ovsdb_idl *idl);
+void filter_mark_unused(void);
+void filter_remove_unused(struct controller_ctx *ctx,
+                          const struct lport_index *lports);
+void filter_lport(struct controller_ctx *ctx, const char *lport_name);
+void filter_datapath(struct controller_ctx *ctx,
+                     const struct sbrec_port_binding *pb);
 
-#endif /* ovn/binding.h */
+#endif /* ovn/controller/filter.h */

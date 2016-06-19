@@ -25,9 +25,11 @@
 struct controller_ctx;
 struct hmap;
 struct ovsrec_bridge;
+struct lport_index;
 
 void patch_run(struct controller_ctx *, const struct ovsrec_bridge *br_int,
                const char *chassis_id, struct hmap *local_datapaths,
-               struct hmap *patched_datapaths);
+               struct hmap *patched_datapaths,
+               struct lport_index *lports_index);
 
 #endif /* ovn/patch.h */

@@ -54,6 +54,7 @@
 #include "stream.h"
 #include "unixctl.h"
 #include "util.h"
+#include "filter.h"
 
 VLOG_DEFINE_THIS_MODULE(main);
 
@@ -390,6 +391,8 @@ main(int argc, char *argv[])
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
     ovsdb_idl_omit_alert(ovnsb_idl_loop.idl, &sbrec_chassis_col_nb_cfg);
 
+    filter_init(ovnsb_idl_loop.idl);
+
     /* Track the southbound idl. */
     ovsdb_idl_track_add_all(ovnsb_idl_loop.idl);
 
@@ -415,6 +418,7 @@ main(int argc, char *argv[])
             binding_reset_processing();
             lport_index_clear(&lports);
             mcgroup_index_clear(&mcgroups);
+            filter_clear(ovnsb_idl_loop.idl);
         } else {
             free(new_ovnsb_remote);
         }
@@ -432,19 +436,21 @@ main(int argc, char *argv[])
         const char *chassis_id = get_chassis_id(ctx.ovs_idl);
 
         const struct sbrec_chassis *chassis = NULL;
+
+        lport_index_fill(&lports, ctx.ovnsb_idl);
+        mcgroup_index_fill(&mcgroups, ctx.ovnsb_idl);
+        filter_mark_unused();
+
         if (chassis_id) {
             chassis = chassis_run(&ctx, chassis_id, br_int);
             encaps_run(&ctx, br_int, chassis_id);
-            binding_run(&ctx, br_int, chassis_id, &local_datapaths,
-                        &all_lports);
+            binding_run(&ctx, br_int, chassis_id, &lports, &local_datapaths,
+                        &patched_datapaths, &all_lports);
         }
 
         if (br_int && chassis_id) {
             patch_run(&ctx, br_int, chassis_id, &local_datapaths,
-                      &patched_datapaths);
-
-            lport_index_fill(&lports, ctx.ovnsb_idl);
-            mcgroup_index_fill(&mcgroups, ctx.ovnsb_idl);
+                      &patched_datapaths, &lports);
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
@@ -467,6 +473,8 @@ main(int argc, char *argv[])
                 }
             }
         }
+
+        filter_remove_unused_lports(&ctx, &lports);
 
         unixctl_server_run(unixctl);
 

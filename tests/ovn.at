@@ -1346,6 +1346,10 @@ ovn-nbctl lsp-set-addresses lp1 f0:00:00:00:00:01
 ovn-nbctl lsp-add lsw0 lp2
 ovn-nbctl lsp-set-addresses lp2 f0:00:00:00:00:02
 
+# Create dummy lport on hv_gw to allow hv_gw access this LS
+ovn-nbctl lsp-add lsw0 lp-dummy
+ovn-nbctl lsp-set-addresses lp-dummy f0:00:00:00:00:ff
+
 ovn-nbctl lsp-add lsw0 lp-gw
 ovn-nbctl lsp-set-type lp-gw l2gateway
 ovn-nbctl lsp-set-options lp-gw network_name=physnet1 l2gateway-chassis=hv_gw
@@ -1377,6 +1381,7 @@ ovn_attach n1 br-phys 192.168.0.3
 ovs-vsctl add-br br-phys2
 net_attach n2 br-phys2
 ovs-vsctl set open . external_ids:ovn-bridge-mappings="physnet1:br-phys2"
+ovs-vsctl add-port br-int vif-dummy -- set Interface vif-dummy external-ids:iface-id=lp-dummy
 
 # Add hv3 on the other side of the GW
 sim_add hv3

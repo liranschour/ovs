@@ -27,6 +27,8 @@
 #include "openvswitch/vlog.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "ovn-controller.h"
+#include "lport.h"
+#include "filter.h"
 
 VLOG_DEFINE_THIS_MODULE(binding);
 
@@ -66,7 +68,9 @@ binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 
 static bool
 get_local_iface_ids(const struct ovsrec_bridge *br_int,
-                    struct shash *lport_to_iface)
+                    struct shash *lport_to_iface,
+                    struct lport_index *lports_index,
+                    struct controller_ctx *ctx)
 {
     int i;
     bool changed = false;
@@ -92,6 +96,9 @@ get_local_iface_ids(const struct ovsrec_bridge *br_int,
                 continue;
             }
             shash_add(lport_to_iface, iface_id, iface_rec);
+            if (!lport_lookup_by_name(lports_index, iface_id)) {
+                filter_lport(ctx, iface_id);
+            }
             if (!sset_find_and_delete(&old_local_ids, iface_id)) {
                 sset_add(&local_ids, iface_id);
                 changed = true;
@@ -123,8 +130,14 @@ local_datapath_lookup_by_uuid(struct hmap *hmap_p, const struct uuid *uuid)
 }
 
 static void
-remove_local_datapath(struct hmap *local_datapaths, struct local_datapath *ld)
+remove_local_datapath(struct controller_ctx *ctx, struct hmap *local_datapaths,
+                      struct hmap *patched_datapaths,
+                      struct local_datapath *ld)
 {
+    if (!get_patched_datapath(patched_datapaths, ld->tunnel_key)) {
+        unfilter_datapath(ctx, ld->tunnel_key);
+    }
+
     if (ld->logical_port) {
         free(ld->logical_port);
         ld->logical_port = NULL;
@@ -136,7 +149,8 @@ remove_local_datapath(struct hmap *local_datapaths, struct local_datapath *ld)
 
 static void
 add_local_datapath(struct hmap *local_datapaths,
-        const struct sbrec_port_binding *binding_rec)
+                   const struct sbrec_port_binding *binding_rec,
+                   struct controller_ctx *ctx)
 {
     if (get_local_datapath(local_datapaths,
                            binding_rec->datapath->tunnel_key)) {
@@ -146,11 +160,13 @@ add_local_datapath(struct hmap *local_datapaths,
     struct local_datapath *ld = xzalloc(sizeof *ld);
     ld->logical_port = xstrdup(binding_rec->logical_port);
     memcpy(&ld->uuid, &binding_rec->header_.uuid, sizeof ld->uuid);
+    ld->tunnel_key = binding_rec->datapath->tunnel_key;
     hmap_insert(local_datapaths, &ld->hmap_node,
                 binding_rec->datapath->tunnel_key);
     lport_index_reset();
     mcgroup_index_reset();
     lflow_reset_processing();
+    filter_datapath(ctx, binding_rec->datapath);
 }
 
 static void
@@ -177,7 +193,7 @@ consider_local_datapath(struct controller_ctx *ctx,
     if (iface_rec
         || (binding_rec->parent_port && binding_rec->parent_port[0] &&
             sset_contains(&local_ids, binding_rec->parent_port))) {
-        add_local_datapath(local_datapaths, binding_rec);
+        add_local_datapath(local_datapaths, binding_rec, ctx);
         if (iface_rec && ctx->ovs_idl_txn) {
             update_qos(iface_rec, binding_rec);
         }
@@ -216,7 +232,7 @@ consider_local_datapath(struct controller_ctx *ctx,
             VLOG_INFO("Claiming l2gateway port %s for this chassis.",
                       binding_rec->logical_port);
             sbrec_port_binding_set_chassis(binding_rec, chassis_rec);
-            add_local_datapath(local_datapaths, binding_rec);
+            add_local_datapath(local_datapaths, binding_rec, ctx);
         }
     } else if (chassis_rec && binding_rec->chassis == chassis_rec
                && strcmp(binding_rec->type, "gateway")) {
@@ -230,7 +246,8 @@ consider_local_datapath(struct controller_ctx *ctx,
 
 void
 binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
-            const char *chassis_id, struct hmap *local_datapaths)
+            const char *chassis_id, struct lport_index *lports_index,
+            struct hmap *local_datapaths, struct hmap *patched_datapaths)
 {
     const struct sbrec_chassis *chassis_rec;
     const struct sbrec_port_binding *binding_rec;
@@ -242,7 +259,8 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
     }
 
     if (br_int) {
-        if (ctx->ovnsb_idl_txn && get_local_iface_ids(br_int, &lport_to_iface)) {
+        if (ctx->ovnsb_idl_txn && get_local_iface_ids(br_int, &lport_to_iface,
+                                                      lports_index, ctx)) {
             process_full_binding = true;
         }
     } else {
@@ -258,8 +276,9 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
         struct hmap keep_local_datapath_by_uuid =
             HMAP_INITIALIZER(&keep_local_datapath_by_uuid);
         SBREC_PORT_BINDING_FOR_EACH(binding_rec, ctx->ovnsb_idl) {
-            consider_local_datapath(ctx, chassis_rec, binding_rec,
-                                    local_datapaths, &lport_to_iface);
+            consider_local_datapath(ctx, chassis_rec,
+                                    binding_rec, local_datapaths,
+                                    &lport_to_iface);
             struct local_datapath *ld = xzalloc(sizeof *ld);
             memcpy(&ld->uuid, &binding_rec->header_.uuid, sizeof ld->uuid);
             hmap_insert(&keep_local_datapath_by_uuid, &ld->uuid_hmap_node,
@@ -269,7 +288,8 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
         HMAP_FOR_EACH_SAFE (old_ld, next, hmap_node, local_datapaths) {
             if (!local_datapath_lookup_by_uuid(&keep_local_datapath_by_uuid,
                                                &old_ld->uuid)) {
-                remove_local_datapath(local_datapaths, old_ld);
+                remove_local_datapath(ctx, local_datapaths, patched_datapaths,
+                                      old_ld);
             }
         }
         hmap_destroy(&keep_local_datapath_by_uuid);
@@ -286,8 +306,9 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
                     poll_immediate_wake();
                 }
             } else {
-                consider_local_datapath(ctx, chassis_rec, binding_rec,
-                                        local_datapaths, &lport_to_iface);
+                consider_local_datapath(ctx, chassis_rec,
+                                        binding_rec, local_datapaths,
+                                        &lport_to_iface);
             }
         }
     }

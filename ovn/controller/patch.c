@@ -24,6 +24,7 @@
 #include "openvswitch/hmap.h"
 #include "openvswitch/vlog.h"
 #include "ovn-controller.h"
+#include "filter.h"
 
 VLOG_DEFINE_THIS_MODULE(patch);
 
@@ -258,7 +259,8 @@ add_bridge_mappings(struct controller_ctx *ctx,
 
 static void
 add_patched_datapath(struct hmap *patched_datapaths,
-                     const struct sbrec_port_binding *binding_rec, bool local)
+                     const struct sbrec_port_binding *binding_rec, bool local,
+                     struct controller_ctx *ctx)
 {
     struct patched_datapath *pd = get_patched_datapath(patched_datapaths,
                                        binding_rec->datapath->tunnel_key);
@@ -273,9 +275,11 @@ add_patched_datapath(struct hmap *patched_datapaths,
     pd->local = local;
     pd->key = xasprintf(UUID_FMT,
                         UUID_ARGS(&binding_rec->datapath->header_.uuid));
+    pd->tunnel_key = binding_rec->datapath->tunnel_key;
     /* stale is set to false. */
     hmap_insert(patched_datapaths, &pd->hmap_node,
                 binding_rec->datapath->tunnel_key);
+    filter_datapath(ctx, binding_rec->datapath);
 }
 
 static void
@@ -292,7 +296,9 @@ add_logical_patch_ports_preprocess(struct hmap *patched_datapaths)
 /* This function should cleanup stale patched datapaths and any memory
  * allocated for fields within a stale patched datapath. */
 static void
-add_logical_patch_ports_postprocess(struct hmap *patched_datapaths)
+add_logical_patch_ports_postprocess(struct hmap *patched_datapaths,
+                                    struct hmap *local_datapaths,
+                                    struct controller_ctx *ctx)
 {
     /* Clean up stale patched datapaths. */
     struct patched_datapath *pd_cur_node, *pd_next_node;
@@ -300,6 +306,9 @@ add_logical_patch_ports_postprocess(struct hmap *patched_datapaths)
                         patched_datapaths) {
         if (pd_cur_node->stale == true) {
             hmap_remove(patched_datapaths, &pd_cur_node->hmap_node);
+            if (!get_local_datapath(local_datapaths, pd_cur_node->tunnel_key)) {
+                unfilter_datapath(ctx, pd_cur_node->tunnel_key);
+            }
             free(pd_cur_node->key);
             free(pd_cur_node);
         }
@@ -333,7 +342,9 @@ add_logical_patch_ports(struct controller_ctx *ctx,
                         const struct ovsrec_bridge *br_int,
                         const char *local_chassis_id,
                         struct shash *existing_ports,
-                        struct hmap *patched_datapaths)
+                        struct hmap *patched_datapaths,
+                        struct hmap *local_datapaths,
+                        struct lport_index *lports_index)
 {
     const struct sbrec_chassis *chassis_rec;
     chassis_rec = get_chassis(ctx->ovnsb_idl, local_chassis_id);
@@ -368,21 +379,25 @@ add_logical_patch_ports(struct controller_ctx *ctx,
                               existing_ports);
             free(dst_name);
             free(src_name);
-            add_patched_datapath(patched_datapaths, binding, local_port);
+            add_patched_datapath(patched_datapaths, binding, local_port, ctx);
             if (local_port) {
                 if (binding->chassis != chassis_rec && ctx->ovnsb_idl_txn) {
                     sbrec_port_binding_set_chassis(binding, chassis_rec);
                 }
             }
+
+            if (!lport_lookup_by_name(lports_index, peer)) {
+                filter_lport(ctx, peer);
+            }
         }
     }
-    add_logical_patch_ports_postprocess(patched_datapaths);
+    add_logical_patch_ports_postprocess(patched_datapaths, local_datapaths, ctx);
 }
 
 void
 patch_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
           const char *chassis_id, struct hmap *local_datapaths,
-          struct hmap *patched_datapaths)
+          struct hmap *patched_datapaths, struct lport_index *lports_index)
 {
     if (!ctx->ovs_idl_txn) {
         return;
@@ -404,7 +419,7 @@ patch_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
      * should be there. */
     add_bridge_mappings(ctx, br_int, &existing_ports, local_datapaths, chassis_id);
     add_logical_patch_ports(ctx, br_int, chassis_id, &existing_ports,
-                            patched_datapaths);
+                            patched_datapaths, local_datapaths, lports_index);
 
     /* Now 'existing_ports' only still contains patch ports that exist in the
      * database but shouldn't.  Delete them from the database. */

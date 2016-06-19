@@ -24,6 +24,10 @@
 #include "openvswitch/vlog.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "ovn-controller.h"
+#include "lport.h"
+#include "filter.h"
+#include "poll-loop.h"
+#include "timeval.h"
 
 VLOG_DEFINE_THIS_MODULE(binding);
 
@@ -50,7 +54,9 @@ binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 }
 
 static void
-get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports)
+get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports,
+                    struct lport_index *lports_index,
+                    struct controller_ctx *ctx)
 {
     int i;
 
@@ -72,13 +78,17 @@ get_local_iface_ids(const struct ovsrec_bridge *br_int, struct shash *lports)
                 continue;
             }
             shash_add(lports, iface_id, iface_rec);
+            if (!lport_lookup_by_name(lports_index, iface_id)) {
+                filter_lport(ctx, iface_id);
+            }
         }
     }
 }
 
 static void
 add_local_datapath(struct hmap *local_datapaths,
-        const struct sbrec_port_binding *binding_rec)
+                   const struct sbrec_port_binding *binding_rec,
+                   struct controller_ctx *ctx)
 {
     if (get_local_datapath(local_datapaths,
                            binding_rec->datapath->tunnel_key)) {
@@ -88,6 +98,7 @@ add_local_datapath(struct hmap *local_datapaths,
     struct local_datapath *ld = xzalloc(sizeof *ld);
     hmap_insert(local_datapaths, &ld->hmap_node,
                 binding_rec->datapath->tunnel_key);
+    filter_datapath(ctx, binding_rec);
 }
 
 static void
@@ -104,7 +115,7 @@ update_qos(const struct ovsrec_interface *iface_rec,
 void
 binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
             const char *chassis_id, struct sset *all_lports,
-            struct hmap *local_datapaths)
+            struct lport_index *lports_index, struct hmap *local_datapaths)
 {
     const struct sbrec_chassis *chassis_rec;
     const struct sbrec_port_binding *binding_rec;
@@ -113,7 +124,7 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
 
     struct shash lports = SHASH_INITIALIZER(&lports);
     if (br_int) {
-        get_local_iface_ids(br_int, &lports);
+        get_local_iface_ids(br_int, &lports, lports_index, ctx);
     } else {
         /* We have no integration bridge, therefore no local logical ports.
          * We'll remove our chassis from all port binding records below. */
@@ -137,7 +148,7 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
                 /* Add child logical port to the set of all local ports. */
                 sset_add(all_lports, binding_rec->logical_port);
             }
-            add_local_datapath(local_datapaths, binding_rec);
+            add_local_datapath(local_datapaths, binding_rec, ctx);
             if (iface_rec && ctx->ovs_idl_txn) {
                 update_qos(iface_rec, binding_rec);
             }
@@ -168,6 +179,12 @@ binding_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
              * a conntrack zone ID for each one, as we'll be creating
              * a patch port for each one. */
             sset_add(all_lports, binding_rec->logical_port);
+        }
+        const char *peer = smap_get(&binding_rec->options, "peer");
+        if (peer) {
+            if (!lport_lookup_by_name(lports_index, peer)) {
+                filter_lport(ctx, peer);
+            }
         }
     }
 

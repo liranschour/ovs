@@ -53,6 +53,7 @@
 #include "stream.h"
 #include "unixctl.h"
 #include "util.h"
+#include "filter.h"
 
 VLOG_DEFINE_THIS_MODULE(main);
 
@@ -383,6 +384,9 @@ main(int argc, char *argv[])
     char *ovnsb_remote = get_ovnsb_remote(ovs_idl_loop.idl);
     struct ovsdb_idl_loop ovnsb_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
+
+    filter_init(ovnsb_idl_loop.idl);
+
     ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
     int probe_interval = 0;
@@ -416,6 +420,7 @@ main(int argc, char *argv[])
             .ovs_idl_txn = ovsdb_idl_loop_run(&ovs_idl_loop),
             .ovnsb_idl = ovnsb_idl_loop.idl,
             .ovnsb_idl_txn = ovsdb_idl_loop_run(&ovnsb_idl_loop),
+            .ovnsb_remote = ovnsb_remote,
         };
 
         /* Contains "struct local_datpath" nodes whose hash values are the
@@ -427,22 +432,22 @@ main(int argc, char *argv[])
 
         const struct ovsrec_bridge *br_int = get_br_int(&ctx);
         const char *chassis_id = get_chassis_id(ctx.ovs_idl);
+        struct lport_index lports;
+        struct mcgroup_index mcgroups;
+        lport_index_init(&lports, ctx.ovnsb_idl);
+        mcgroup_index_init(&mcgroups, ctx.ovnsb_idl);
+        filter_mark_unused();
 
         if (chassis_id) {
             chassis_run(&ctx, chassis_id);
             encaps_run(&ctx, br_int, chassis_id);
-            binding_run(&ctx, br_int, chassis_id, &all_lports,
+            binding_run(&ctx, br_int, chassis_id, &all_lports, &lports,
                         &local_datapaths);
         }
 
         if (br_int && chassis_id) {
             patch_run(&ctx, br_int, chassis_id, &local_datapaths,
                       &patched_datapaths);
-
-            struct lport_index lports;
-            struct mcgroup_index mcgroups;
-            lport_index_init(&lports, ctx.ovnsb_idl);
-            mcgroup_index_init(&mcgroups, ctx.ovnsb_idl);
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
@@ -460,9 +465,11 @@ main(int argc, char *argv[])
             }
             ofctrl_put(&flow_table);
             hmap_destroy(&flow_table);
-            mcgroup_index_destroy(&mcgroups);
-            lport_index_destroy(&lports);
         }
+
+        filter_remove_unused(&ctx);
+        mcgroup_index_destroy(&mcgroups);
+        lport_index_destroy(&lports);
 
         sset_destroy(&all_lports);
 

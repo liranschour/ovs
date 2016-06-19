@@ -22,6 +22,7 @@
 #include "lib/vswitch-idl.h"
 #include "openvswitch/vlog.h"
 #include "ovn-controller.h"
+#include "filter.h"
 
 VLOG_DEFINE_THIS_MODULE(patch);
 
@@ -230,7 +231,8 @@ add_bridge_mappings(struct controller_ctx *ctx,
 
 static void
 add_patched_datapath(struct hmap *patched_datapaths,
-                     const struct sbrec_port_binding *binding_rec, bool local)
+                     const struct sbrec_port_binding *binding_rec, bool local,
+                     struct controller_ctx *ctx)
 {
     if (get_patched_datapath(patched_datapaths,
                              binding_rec->datapath->tunnel_key)) {
@@ -242,6 +244,7 @@ add_patched_datapath(struct hmap *patched_datapaths,
     pd->port_binding = binding_rec;
     hmap_insert(patched_datapaths, &pd->hmap_node,
                 binding_rec->datapath->tunnel_key);
+    filter_datapath(ctx, binding_rec);
 }
 
 /* Add one OVS patch port for each OVN logical patch port.
@@ -304,7 +307,7 @@ add_logical_patch_ports(struct controller_ctx *ctx,
                               existing_ports);
             free(dst_name);
             free(src_name);
-            add_patched_datapath(patched_datapaths, binding, local_port);
+            add_patched_datapath(patched_datapaths, binding, local_port, ctx);
             if (local_port) {
                 if (binding->chassis != chassis_rec && ctx->ovnsb_idl_txn) {
                     sbrec_port_binding_set_chassis(binding, chassis_rec);

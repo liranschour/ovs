@@ -70,6 +70,7 @@ struct patched_datapath {
     bool local; /* 'True' if the datapath is for gateway router. */
     bool stale; /* 'True' if the datapath is not referenced by any patch
                  * port. */
+    int64_t tunnel_key;
 };
 
 struct patched_datapath *get_patched_datapath(const struct hmap *,

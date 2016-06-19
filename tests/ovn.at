@@ -1525,6 +1525,10 @@ done
 
 ovn_populate_arp
 
+# Allow some time for ovn-northd and ovn-controller to catch up.
+# XXX This should be more systematic.
+sleep 1
+
 # XXX This is now the 3rd copy of these functions in this file ...
 
 # Given the name of a logical port, prints the name of the hypervisor
@@ -1809,6 +1813,10 @@ ovn-nbctl lsp-set-addresses lp1 f0:00:00:00:00:01
 ovn-nbctl lsp-add lsw0 lp2
 ovn-nbctl lsp-set-addresses lp2 f0:00:00:00:00:02
 
+# Create dummy lport to make lsw0 visible on hv_gw
+ovn-nbctl lsp-add lsw0 lp-dummy
+ovn-nbctl lsp-set-addresses lp-dummy f0:00:00:00:00:ff
+
 ovn-nbctl lsp-add lsw0 lp-gw
 ovn-nbctl lsp-set-type lp-gw l2gateway
 ovn-nbctl lsp-set-options lp-gw network_name=physnet1 l2gateway-chassis=hv_gw
@@ -1840,6 +1848,7 @@ ovn_attach n1 br-phys 192.168.0.3
 ovs-vsctl add-br br-phys2
 net_attach n2 br-phys2
 ovs-vsctl set open . external_ids:ovn-bridge-mappings="physnet1:br-phys2"
+ovs-vsctl add-port br-int vif-dummy -- set Interface vif-dummy external-ids:iface-id=lp-dummy
 
 # Add hv3 on the other side of the GW
 sim_add hv3
@@ -5038,6 +5047,9 @@ ovn-nbctl lsp-add ls0 lrp0-rp -- set Logical_Switch_Port lrp0-rp \
     type=router options:router-port=lrp0-rp addresses='"f0:00:00:00:00:01"'
 # Add nat-address option
 ovn-nbctl lsp-set-options lrp0-rp router-port=lrp0 nat-addresses="f0:00:00:00:00:01 192.168.0.2"
+# Create dummy lport to make ls0 visible on hv1
+ovn-nbctl lsp-add ls0 lp-dummy
+
 
 net_add n1
 sim_add hv1
@@ -5047,6 +5059,9 @@ ovs-vsctl \
     -- add-br br-eth0
 
 ovn_attach n1 br-phys 192.168.0.1
+
+ovs-vsctl \
+    -- add-port br-int vif-dummy -- set Interface vif-dummy external-ids:iface-id=lp-dummy
 
 AT_CHECK([ovs-vsctl set Open_vSwitch . external-ids:ovn-bridge-mappings=physnet1:br-eth0])
 AT_CHECK([ovs-vsctl add-port br-eth0 snoopvif -- set Interface snoopvif options:tx_pcap=hv1/snoopvif-tx.pcap options:rxq_pcap=hv1/snoopvif-rx.pcap])
@@ -5315,10 +5330,6 @@ AT_CHECK([ovs-vsctl add-port br-int localvif1 -- set Interface localvif1 externa
 
 # On hv1, check that there are no flows outputting bcast to tunnel
 OVS_WAIT_UNTIL([test `ovs-ofctl dump-flows br-int table=32 | ofctl_strip | grep output | wc -l` -eq 0])
-
-# On hv2, check that there is 1 flow outputting bcast to tunnel to hv1.
-as hv2
-OVS_WAIT_UNTIL([test `ovs-ofctl dump-flows br-int table=32 | ofctl_strip | grep output | wc -l` -eq 1])
 
 # Now bind vif2 on hv2.
 AT_CHECK([ovs-vsctl add-port br-int localvif2 -- set Interface localvif2 external_ids:iface-id=localvif2])

@@ -241,6 +241,11 @@ bool %(s)s_is_updated(const struct %(s)s *, enum %(s)s_column_id);
             else:
                 comment, members = cMembers(prefix, tableName, columnName,
                                             column, True)
+                if column.type.key.is_ref():
+                    if column.type.n_max == 1:
+                        members[0]['type'] = 'struct uuid *'
+                    else:
+                        members[0]['type'] = 'struct uuid **'
                 args = ['%(type)s%(name)s' % member for member in members]
             print '%s);' % ', '.join(args)
 
@@ -255,6 +260,11 @@ bool %(s)s_is_updated(const struct %(s)s *, enum %(s)s_column_id);
             else:
                 comment, members = cMembers(prefix, tableName, columnName,
                                             column, True)
+                if column.type.key.is_ref():
+                    if column.type.n_max == 1:
+                        members[0]['type'] = 'struct uuid *'
+                    else:
+                        members[0]['type'] = 'struct uuid **'
                 args = ['%(type)s%(name)s' % member for member in members]
             print '%s);' % ', '.join(args)
 
@@ -916,6 +926,12 @@ void
                 if len(members) > 1:
                     nVar = members[1]['name']
 
+            if type.key.is_ref():
+                if column.type.n_max == 1:
+                    members[0]['type'] = 'struct uuid *'
+                else:
+                    members[0]['type'] = 'struct uuid **'
+
             print comment
             print 'void'
             print '%(s)s_add_clause_%(c)s(struct ovsdb_idl *idl, enum ovsdb_function function, %(args)s)' % \
@@ -931,7 +947,10 @@ void
                 print "    ovs_assert(inited);"
                 print "    datum.n = 1;"
                 print "    datum.keys = &key;"
-                print "    " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
+                if type.key.is_ref():
+                    print "    key.%s = *%s;" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "    " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
                 if type.value:
                     print "    datum.values = &value;"
                     print "    "+ type.value.assign_c_value_casting_away_const("value.%s" % type.value.type.to_string(), valueVar)
@@ -944,7 +963,10 @@ void
                 print "    if (%s) {" % keyVar
                 print "        datum.n = 1;"
                 print "        datum.keys = &key;"
-                print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
+                if type.key.is_ref():
+                    print "    key.%s = *%s;" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
                 print "    } else {"
                 print "        datum.n = 0;"
                 print "        datum.keys = NULL;"
@@ -957,7 +979,10 @@ void
                 print "    if (%s) {" % nVar
                 print "        datum.n = 1;"
                 print "        datum.keys = &key;"
-                print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), "*" + keyVar)
+                if type.key.is_ref():
+                    print "    key.%s = *%s;" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), "*" + keyVar)
                 print "    } else {"
                 print "        datum.n = 0;"
                 print "        datum.keys = NULL;"
@@ -974,7 +999,10 @@ void
                 else:
                     print "    datum.values = NULL;"
                 print "    for (i = 0; i < %s; i++) {" % nVar
-                print "        " + type.key.copyCValue("datum.keys[i].%s" % type.key.type.to_string(), "%s[i]" % keyVar)
+                if type.key.is_ref():
+                    print "        datum.keys[i].%s = *%s[i];" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "        " + type.key.copyCValue("datum.keys[i].%s" % type.key.type.to_string(), "%s[i]" % keyVar)
                 if type.value:
                     print "        " + type.value.copyCValue("datum.values[i].%s" % type.value.type.to_string(), "%s[i]" % valueVar)
                 print "    }"
@@ -1082,6 +1110,12 @@ void
                 if len(members) > 1:
                     nVar = members[1]['name']
 
+            if type.key.is_ref():
+                if type.n_max == 1:
+                    members[0]['type'] = 'struct uuid *'
+                else:
+                    members[0]['type'] = 'struct uuid **'
+
             print comment
             print 'void'
             print '%(s)s_remove_clause_%(c)s(struct ovsdb_idl *idl, enum ovsdb_function function, %(args)s)' % \
@@ -1097,7 +1131,10 @@ void
                 print "    ovs_assert(inited);"
                 print "    datum.n = 1;"
                 print "    datum.keys = &key;"
-                print "    " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
+                if type.key.is_ref():
+                    print "    key.%s = *%s;" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "    " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
                 if type.value:
                     print "    datum.values = &value;"
                     print "    "+ type.value.assign_c_value_casting_away_const("value.%s" % type.value.type.to_string(), valueVar)
@@ -1110,7 +1147,10 @@ void
                 print "    if (%s) {" % keyVar
                 print "        datum.n = 1;"
                 print "        datum.keys = &key;"
-                print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
+                if type.key.is_ref():
+                    print "    key.%s = *%s;" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), keyVar)
                 print "    } else {"
                 print "        datum.n = 0;"
                 print "        datum.keys = NULL;"
@@ -1123,7 +1163,10 @@ void
                 print "    if (%s) {" % nVar
                 print "        datum.n = 1;"
                 print "        datum.keys = &key;"
-                print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), "*" + keyVar)
+                if type.key.is_ref():
+                    print "    key.%s = *%s;" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "        " + type.key.assign_c_value_casting_away_const("key.%s" % type.key.type.to_string(), "*" + keyVar)
                 print "    } else {"
                 print "        datum.n = 0;"
                 print "        datum.keys = NULL;"
@@ -1140,7 +1183,10 @@ void
                 else:
                     print "    datum.values = NULL;"
                 print "    for (i = 0; i < %s; i++) {" % nVar
-                print "        " + type.key.copyCValue("datum.keys[i].%s" % type.key.type.to_string(), "%s[i]" % keyVar)
+                if type.key.is_ref():
+                    print "        datum.keys[i].%s = *%s[i];" % (type.key.type.to_string(), keyVar)
+                else:
+                    print "        " + type.key.copyCValue("datum.keys[i].%s" % type.key.type.to_string(), "%s[i]" % keyVar)
                 if type.value:
                     print "        " + type.value.copyCValue("datum.values[i].%s" % type.value.type.to_string(), "%s[i]" % valueVar)
                 print "    }"
